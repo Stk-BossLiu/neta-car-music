@@ -5112,16 +5112,38 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     // ---------- 桌面小组件 ----------
 
-    /** MainActivity 每次创建时调；[fresh] 是全新启动（不是旋转重建），收起上次留下的播放页和海报墙。 */
+    /**
+     * MainActivity 每次创建时调；[fresh] 是全新启动（不是旋转重建），收起上次留下的播放页和海报墙。
+     * 进程被杀后带着界面状态重建（[fresh] 为假、但本进程第一次见到界面）也算一次启动，照常触发自动播放。
+     */
     fun onUiLaunched(fresh: Boolean) {
+        val firstUi = !uiLaunched.value
         if (fresh) base.update { it.copy(playerOpen = false, posterOpen = false) }
         connectController()
         uiLaunched.value = true
-        if (fresh) viewModelScope.launch {
+        if (fresh || firstUi) autoPlayOnLaunch()
+    }
+
+    /** 启动时的自动播放：只看「启动时自动播放」设置，用户上次是不是自己暂停的不影响。 */
+    fun autoPlayOnLaunch() = launchAutoPlay(respectUserPause = false)
+
+    /**
+     * 回到应用、亮屏时的自动播放：接的是上次的茬，用户自己按的暂停（睡眠定时停的也一样）就不打扰，
+     * 等真正启动应用再按设置来。被系统打断的（抢焦点、车机静音、电视布局的离开暂停）照常接上。
+     */
+    fun autoPlayOnReturn() = launchAutoPlay(respectUserPause = true)
+
+    /** 重复调用无副作用：设置关着、本来就在播或没队列可接就什么都不做。 */
+    private fun launchAutoPlay(respectUserPause: Boolean) {
+        viewModelScope.launch {
             if (!app.settings.state.first().autoPlayOnLaunch) return@launch
+            // 车机媒体静音（或因静音暂停）时不自动开播：解除静音时静音联动自己会接上
+            if (app.carMedia?.let { it.isMuted == true || it.isPausedForMute } == true) return@launch
             val player = awaitController() ?: return@launch
             restoreJob?.await()
             if (player.playWhenReady) return@launch
+            // interruptedBySystem 记着最近一次暂停是谁按的：只有被系统打断的回来才接
+            if (respectUserPause && !interruptedBySystem) return@launch
             if (dormant != null && player.mediaItemCount == 0) {
                 launchResume()
             } else if (player.mediaItemCount > 0) {
