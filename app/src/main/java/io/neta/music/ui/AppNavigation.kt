@@ -1,6 +1,7 @@
 package io.neta.music.ui
 
 import android.app.Activity
+import android.content.Intent
 import android.os.SystemClock
 import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.foundation.background
@@ -79,6 +80,7 @@ import androidx.navigation.compose.rememberNavController
 import kotlinx.coroutines.launch
 import kotlin.coroutines.cancellation.CancellationException
 import io.neta.music.data.TopList
+import io.neta.music.playback.PlaybackService
 import io.neta.music.ui.adaptive.BottomPlayerBar
 import io.neta.music.ui.adaptive.BottomPlayerBarHeight
 import io.neta.music.ui.adaptive.HomeTopBar
@@ -352,10 +354,19 @@ fun MyMusicApp(model: MusicViewModel) {
                         .then(if (showHomeTopBar) Modifier.windowInsetsPadding(WindowInsets.statusBars) else Modifier),
                 ) {
                     if (showHomeTopBar) {
+                        val context = LocalContext.current
                         HomeTopBar(
                             selected = selectedTab,
                             onSelect = ::openTab,
                             onSettings = { openSettings("settings") },
+                            // 离开只是把界面收回后台，音乐照常播（电视布局仍按设置里的后台播放走）
+                            onLeaveApp = { (context as? Activity)?.moveTaskToBack(true) },
+                            onExitApp = {
+                                // 停声音、放开控制器再收掉服务；队列留在盘上，下次启动自动播放接着放
+                                model.stopForExit()
+                                context.stopService(Intent(context, PlaybackService::class.java))
+                                (context as? Activity)?.finish()
+                            },
                         )
                     }
                     Box(Modifier.weight(1f)) {

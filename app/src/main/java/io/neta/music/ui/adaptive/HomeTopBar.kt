@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Minimize
+import androidx.compose.material.icons.outlined.PowerSettingsNew
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -27,9 +29,15 @@ import io.neta.music.ui.TopTab
 import io.neta.music.ui.components.LocalAppWindow
 import io.neta.music.ui.components.tvFocusRing
 
-/** 手机、平板与车机共用顶部导航；Tab 可横向滚动，设置始终留在右侧。 */
+/** 手机、平板与车机共用顶部导航；Tab 可横向滚动，右侧依次是离开、退出和设置。 */
 @Composable
-fun HomeTopBar(selected: String, onSelect: (String) -> Unit, onSettings: () -> Unit) {
+fun HomeTopBar(
+    selected: String,
+    onSelect: (String) -> Unit,
+    onSettings: () -> Unit,
+    onLeaveApp: () -> Unit,
+    onExitApp: () -> Unit,
+) {
     val window = LocalAppWindow.current
     val tabs = TopTab.entries
     val selectedIndex = tabs.indexOfFirst { it.route == selected }.coerceAtLeast(0)
@@ -69,6 +77,18 @@ fun HomeTopBar(selected: String, onSelect: (String) -> Unit, onSettings: () -> U
                     )
                 }
             }
+        }
+        IconButton(
+            onClick = onLeaveApp,
+            modifier = Modifier.size(48.dp).tvFocusRing(CircleShape),
+        ) {
+            Icon(Icons.Outlined.Minimize, "离开应用", Modifier.size(26.dp))
+        }
+        IconButton(
+            onClick = onExitApp,
+            modifier = Modifier.size(48.dp).tvFocusRing(CircleShape),
+        ) {
+            Icon(Icons.Outlined.PowerSettingsNew, "退出应用", Modifier.size(26.dp))
         }
         IconButton(
             onClick = onSettings,

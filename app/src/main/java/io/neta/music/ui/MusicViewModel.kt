@@ -4854,6 +4854,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         sleepQueue(index, _position.value)
     }
 
+    /** 顶栏「退出应用」：先停声音再放开控制器；队列和位置照常落盘，下次启动自动播放从这里接上。 */
+    fun stopForExit() {
+        controller?.let { player -> if (player.isPlaying || player.playWhenReady) player.pause() }
+        releasePlayer()
+    }
+
     /**
      * 从最近任务划掉、又没在播放时播放服务要停下：先放开控制器，不然服务一直被绑着停不掉。
      * 队列和位置留在 [dormant] 里，界面再打开、组件再按播放都从这里接上。
