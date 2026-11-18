@@ -167,7 +167,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        lifecycleScope.launch { (application as io.neta.music.MyMusicApp).musicMcp.restoreIfEnabled() }
+        lifecycleScope.launch {
+            val app = application as io.neta.music.MyMusicApp
+            app.musicMcp.restoreIfEnabled()
+            // 安装后的首次启动主线程要忙 dexopt 和首帧，startForegroundService 的 5 秒进前台窗口可能赶不上
+            // （模拟器实测崩过一次）。远控默认开启，晚几秒再拉起避开窗口；扫码入口打开时也会自己拉起。
+            kotlinx.coroutines.delay(3_000)
+            app.remoteControl.restoreIfEnabled()
+        }
         // 从桌面、别的应用或亮屏回到应用（任务还在、界面没重建）：也算一次打开，接着自动播放。
         // 用户自己暂停过的回来不自动响（autoPlayOnReturn 里判断）
         if (seenStart) model.autoPlayOnReturn()

@@ -305,7 +305,7 @@ private fun String.lanPriority(): Int {
  * 枚举网卡取要展示给手机的地址。服务本身监听通配地址（bindHost 为空时 NanoHTTPD 绑
  * 0.0.0.0），所有网卡都进得来，所以这里只决定二维码和页面上写哪个地址。
  */
-private fun findSyncSetupAddress(): InetAddress? = runCatching {
+internal fun findSyncSetupAddress(): InetAddress? = runCatching {
     val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
     Collections.list(interfaces)
         .filter { it.isUp && !it.isLoopback }

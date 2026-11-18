@@ -5257,6 +5257,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         return awaitPlaybackStart()
     }
 
+    /** 手机远控网页的搜歌：直接用聚合引擎取结果列表，不动界面的搜索状态。 */
+    internal suspend fun searchForRemote(query: String): List<CanonicalTrack> {
+        settingsReady.first { it }
+        val keyword = query.trim()
+        if (keyword.isEmpty()) return emptyList()
+        val all = app.repository.providers().filter { it.search }
+        val enabled = settingsState.value.aggregation.enabledOrDefault(all.map { it.id })
+        val providers = all.filter { it.id in enabled }
+        if (providers.isEmpty()) return emptyList()
+        val result = searchEngine.search(keyword, providers)
+            .first { it is SearchUpdate.Completed } as SearchUpdate.Completed
+        return result.groups
+    }
+
     /**
      * 外部点歌插播：播放器里已有队列就把点播的这首解析好插到正在放的这首后面并立刻切过去，
      * 原队列其余不动，唱完接着放回原列表；还没有队列时按原来的样子新建单曲队列起播。
