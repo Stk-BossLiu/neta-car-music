@@ -165,6 +165,7 @@ fun MyMusicApp(model: MusicViewModel) {
     var selectedTab by rememberSaveable { mutableStateOf(startupTab.route) }
     var queueOpen by rememberSaveable { mutableStateOf(false) }
     var timerOpen by rememberSaveable { mutableStateOf(false) }
+    var remoteOpen by rememberSaveable { mutableStateOf(false) }
 
     fun openTab(tab: String) {
         val currentTab = nav.currentBackStack.value.lastOrNull { entry ->
@@ -367,6 +368,7 @@ fun MyMusicApp(model: MusicViewModel) {
                                 context.stopService(Intent(context, PlaybackService::class.java))
                                 (context as? Activity)?.finish()
                             },
+                            onRemoteOpen = { remoteOpen = true },
                         )
                     }
                     Box(Modifier.weight(1f)) {
@@ -492,6 +494,9 @@ fun MyMusicApp(model: MusicViewModel) {
         }
         if (timerOpen) {
             PlayerTheme { SleepTimerSheet(state, sleep, actions, onDismiss = { timerOpen = false }) }
+        }
+        if (remoteOpen) {
+            io.neta.music.ui.remote.RemoteControlSheet(onDismiss = { remoteOpen = false })
         }
         // 本地歌的上传面板（设计稿第 ⑥ 张）：本地音乐页、歌曲信息、加进歌单后的提示都从这里打开
         io.neta.music.ui.local.LocalUploadSheetHost(

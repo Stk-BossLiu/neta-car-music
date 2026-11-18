@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Minimize
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.PowerSettingsNew
+import androidx.compose.material.icons.outlined.QrCode2
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -38,7 +39,7 @@ import io.neta.music.ui.TopTab
 import io.neta.music.ui.components.LocalAppWindow
 import io.neta.music.ui.components.tvFocusRing
 
-/** 手机、平板与车机共用顶部导航；Tab 可横向滚动。大屏右侧依次是离开、退出和设置，手机收进「更多」菜单。 */
+/** 手机、平板与车机共用顶部导航；Tab 可横向滚动。大屏右侧依次是远控、离开、退出和设置，手机收进「更多」菜单。 */
 @Composable
 fun HomeTopBar(
     selected: String,
@@ -46,6 +47,7 @@ fun HomeTopBar(
     onSettings: () -> Unit,
     onLeaveApp: () -> Unit,
     onExitApp: () -> Unit,
+    onRemoteOpen: () -> Unit,
 ) {
     val window = LocalAppWindow.current
     val tabs = TopTab.entries
@@ -103,6 +105,11 @@ fun HomeTopBar(
                     shape = RoundedCornerShape(20.dp),
                 ) {
                     DropdownMenuItem(
+                        text = { Text("手机远控") },
+                        leadingIcon = { Icon(Icons.Outlined.QrCode2, null) },
+                        onClick = { menuOpen = false; onRemoteOpen() },
+                    )
+                    DropdownMenuItem(
                         text = { Text("离开应用") },
                         leadingIcon = { Icon(Icons.Outlined.Minimize, null) },
                         onClick = { menuOpen = false; onLeaveApp() },
@@ -120,6 +127,12 @@ fun HomeTopBar(
                 }
             }
         } else {
+            IconButton(
+                onClick = onRemoteOpen,
+                modifier = Modifier.size(48.dp).tvFocusRing(CircleShape),
+            ) {
+                Icon(Icons.Outlined.QrCode2, "手机远控", Modifier.size(26.dp))
+            }
             IconButton(
                 onClick = onLeaveApp,
                 modifier = Modifier.size(48.dp).tvFocusRing(CircleShape),

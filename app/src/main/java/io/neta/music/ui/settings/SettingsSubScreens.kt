@@ -132,6 +132,7 @@ import io.neta.music.ui.components.AdaptiveSheet
 import io.neta.music.ui.components.ConnectedToggleGroup
 import io.neta.music.ui.components.IconTone
 import io.neta.music.ui.components.ListRow
+import io.neta.music.ui.components.ScanInputIcons
 import io.neta.music.ui.components.LocalAppWindow
 import io.neta.music.ui.components.PlayButtonSize
 import io.neta.music.ui.components.PlayPauseButton
@@ -1428,6 +1429,7 @@ private fun CookieDialog(provider: ProviderInfo, initial: String, onSave: (Strin
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp).heightIn(min = 100.dp),
                     placeholder = { Text("粘贴 Cookie") },
                     visualTransformation = PasswordVisualTransformation(),
+                    trailingIcon = { ScanInputIcons("Cookie", onValueChange = { value = it }) },
                 )
             }
         },
@@ -1519,6 +1521,7 @@ private fun SodaSignerDialog(
                             label = { Text("签名服务地址") },
                             placeholder = { Text("http://192.168.1.10:8899/sign") },
                             singleLine = true,
+                            trailingIcon = { ScanInputIcons("签名服务地址", onValueChange = { url = it }) },
                         )
                         OutlinedTextField(
                             value = token,
@@ -1527,6 +1530,7 @@ private fun SodaSignerDialog(
                             label = { Text("Token（可选）") },
                             visualTransformation = PasswordVisualTransformation(),
                             singleLine = true,
+                            trailingIcon = { ScanInputIcons("Token", onValueChange = { token = it }) },
                         )
                     } else {
                         Text(

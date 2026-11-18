@@ -100,6 +100,7 @@ import io.neta.music.ui.components.AdaptiveSheet
 import io.neta.music.ui.components.ConnectedToggleGroup
 import io.neta.music.ui.components.IconTone
 import io.neta.music.ui.components.ListRow
+import io.neta.music.ui.components.ScanInputIcons
 import io.neta.music.ui.components.LocalAppWindow
 import io.neta.music.ui.components.LocalOverlayPadding
 import io.neta.music.ui.components.PageScaffold
@@ -822,11 +823,14 @@ fun SyncConnectScreen(
             label = { Text("访问令牌") },
             leadingIcon = { Icon(Icons.Filled.Lock, null) },
             trailingIcon = {
-                IconButton(onClick = { showToken = !showToken }) {
-                    Icon(
-                        if (showToken) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                        if (showToken) "隐藏令牌" else "显示令牌",
-                    )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { showToken = !showToken }) {
+                        Icon(
+                            if (showToken) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                            if (showToken) "隐藏令牌" else "显示令牌",
+                        )
+                    }
+                    ScanInputIcons("访问令牌", onValueChange = { token = it.trim() })
                 }
             },
             visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
@@ -846,6 +850,7 @@ fun SyncConnectScreen(
             label = { Text(if (gist) "Gist ID（可选）" else "代码片段 ID（可选）") },
             placeholder = { Text(if (gist) "留空则新建一个私密 Gist" else "留空则新建一个私密代码片段") },
             supportingText = { Text("也可以粘贴已有的链接") },
+            trailingIcon = { ScanInputIcons("Gist 链接", onValueChange = { remote = it }) },
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
         )
         if (window.isTv) {
