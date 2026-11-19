@@ -1,6 +1,7 @@
 package io.neta.music.data.lx
 
 import android.content.Context
+import io.neta.music.data.CdnMirrors
 import io.neta.music.data.Song
 import io.neta.music.data.native.PlayableStream
 import kotlinx.coroutines.CancellationException
@@ -39,6 +40,7 @@ object LxSources : LxPlayback {
     private val configurationGeneration = AtomicLong(0)
     private val failedLock = Any()
     private val failedScripts = LinkedHashMap<String, MutableSet<String>>()
+    private val mirrors by lazy { appContext?.let { CdnMirrors.load(it) }.orEmpty() }
 
     @Volatile
     private var store: LxSourceStore? = null
@@ -89,7 +91,7 @@ object LxSources : LxPlayback {
 
     suspend fun importOnline(url: String): LxSourceRecord {
         val normalized = normalizeUrl(url)
-        val script = download(normalized)
+        val script = downloadScript(normalized)
         return importScript(script, normalized)
     }
 
@@ -98,8 +100,36 @@ object LxSources : LxPlayback {
 
     suspend fun update(record: LxSourceRecord): LxSourceRecord {
         require(record.sourceUrl.isNotBlank()) { "本地导入的音源请用“替换”选择新脚本" }
-        val script = download(record.sourceUrl)
+        val script = downloadScript(record.sourceUrl)
         return importScript(script, record.sourceUrl, record.id)
+    }
+
+    /** 首次冷启动自动导入内置音源：跳过已存在项、尊重数量上限，单个失败继续；结果供一次性标记判定。 */
+    suspend fun importBuiltinAll(): BuiltinImportSummary {
+        var imported = 0
+        var existing = 0
+        var skipped = 0
+        var failed = 0
+        for (source in LxBuiltinSources.all) {
+            val records = requireStore().records.value
+            if (records.any { it.sourceUrl == source.url }) {
+                existing++
+                continue
+            }
+            if (records.size >= MAX_LX_SOURCES) {
+                skipped++
+                continue
+            }
+            try {
+                importOnline(source.url)
+                imported++
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                failed++
+            }
+        }
+        return BuiltinImportSummary(imported, existing, skipped, failed)
     }
 
     suspend fun setEnabled(id: String, enabled: Boolean) = importMutex.withLock {
@@ -268,6 +298,31 @@ object LxSources : LxPlayback {
     private fun bumpGeneration() {
         configurationGeneration.incrementAndGet()
         synchronized(failedLock) { failedScripts.clear() }
+    }
+
+    /** GitHub 直链在多数车机网络上不可达：先按 cdn-providers.json 线路逐条回退，全部失败再直连兜底一次。 */
+    private suspend fun downloadScript(url: String): String {
+        val host = url.toHttpUrl().host
+        if (host != "raw.githubusercontent.com" && host != "github.com") return download(url)
+        var lastError: Throwable? = null
+        for (mirror in mirrors) {
+            try {
+                return download(CdnMirrors.url(mirror, url))
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                lastError = error
+            }
+        }
+        try {
+            return download(url)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            lastError = error
+        }
+        val detail = lastError?.message?.lineSequence()?.firstOrNull().orEmpty()
+        throw IllegalStateException("所有下载线路均不可用${if (detail.isBlank()) "" else "：$detail"}")
     }
 
     private suspend fun download(url: String): String = withContext(Dispatchers.IO) {

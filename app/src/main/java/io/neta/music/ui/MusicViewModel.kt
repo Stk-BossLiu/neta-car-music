@@ -696,6 +696,22 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         viewModelScope.launch {
+            // 首次冷启动后台补齐内置洛雪音源：至少导入一个或本就无缺失即记为完成，
+            // 全部失败（如离线）不置位，下次冷启动重试；缺的可在设置的内置页签手动补。
+            if (!app.settings.state.first().lxBuiltinImported) {
+                val summary = try {
+                    LxSources.importBuiltinAll()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    null
+                }
+                if (summary != null && (summary.imported > 0 || summary.failed == 0)) {
+                    app.settings.lxBuiltinImported(true)
+                }
+            }
+        }
+        viewModelScope.launch {
             // 冷启动先把上次存下来的账号资料铺上：等各平台用户信息接口返回之前，
             // 账号卡片已经有头像和昵称可看，不然每次开 App 都要空一会儿
             accountProfileCache = app.accountProfiles.snapshot()

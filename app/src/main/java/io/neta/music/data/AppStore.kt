@@ -185,6 +185,8 @@ class SettingsStore(private val context: Context) {
     /** 手机远控（局域网页点歌、剪贴板）的总开关：默认开，关掉后不再随应用自动启动。 */
     private val remoteEnabledKey = booleanPreferencesKey("remote_enabled")
     private val lastSuccessfulUpdateCdnKey = stringPreferencesKey("last_successful_update_cdn")
+    /** 首次冷启动自动导入内置洛雪音源的一次性标记；全部失败不置位，下次冷启动重试。 */
+    private val lxBuiltinImportedKey = booleanPreferencesKey("lx_builtin_imported")
     private val dynamicColorKey = booleanPreferencesKey("dynamic_color")
     private val reduceMotionKey = booleanPreferencesKey("reduce_motion")
     private val volumeNormalizationKey = booleanPreferencesKey("volume_normalization")
@@ -283,6 +285,7 @@ class SettingsStore(private val context: Context) {
             mcpBinding = values[mcpBindingKey] ?: "",
             remoteEnabled = values[remoteEnabledKey] ?: true,
             lastSuccessfulUpdateCdn = values[lastSuccessfulUpdateCdnKey] ?: "",
+            lxBuiltinImported = values[lxBuiltinImportedKey] ?: false,
             dynamicColor = values[dynamicColorKey] ?: false,
             reduceMotion = values[reduceMotionKey] ?: false,
             volumeNormalization = values[volumeNormalizationKey] ?: false,
@@ -350,6 +353,7 @@ class SettingsStore(private val context: Context) {
     suspend fun remoteEnabled(value: Boolean) = context.dataStore.edit { it[remoteEnabledKey] = value }
     suspend fun mcpBinding(value: String) = context.dataStore.edit { it[mcpBindingKey] = value }
     suspend fun lastSuccessfulUpdateCdn(value: String) = context.dataStore.edit { it[lastSuccessfulUpdateCdnKey] = value }
+    suspend fun lxBuiltinImported(value: Boolean) = context.dataStore.edit { it[lxBuiltinImportedKey] = value }
     suspend fun chartsSource(value: String) = context.dataStore.edit { it[chartsSourceKey] = value }
     suspend fun playlistsSource(value: String) = context.dataStore.edit { it[playlistsSourceKey] = value }
     suspend fun startupTab(value: String) = context.dataStore.edit { it[startupTabKey] = value }
@@ -644,6 +648,8 @@ data class AppSettings(
     /** 手机远控是否随应用自动启动；默认开。 */
     val remoteEnabled: Boolean = true,
     val lastSuccessfulUpdateCdn: String = "",
+    /** 首次冷启动是否已自动导入过内置洛雪音源；导入全部失败不置位，下次冷启动重试。 */
+    val lxBuiltinImported: Boolean = false,
     val dynamicColor: Boolean = false,
     val reduceMotion: Boolean = false,
     val volumeNormalization: Boolean = false,

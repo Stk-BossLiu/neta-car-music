@@ -15,9 +15,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -49,6 +51,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import io.neta.music.data.lx.LxBuiltinSource
+import io.neta.music.data.lx.LxBuiltinSources
 import io.neta.music.data.lx.LxPlatform
 import io.neta.music.data.lx.LxSourceRecord
 import io.neta.music.data.lx.LxSources
@@ -117,8 +121,8 @@ internal fun LxSourcesSettingsScreen(
                 iconTone = IconTone.Primary,
                 summary = when {
                     records.size >= MAX_LX_SOURCES -> "最多保存 $MAX_LX_SOURCES 个音源"
-                    records.isEmpty() -> "在线地址或本地文件，可添加多个"
-                    else -> "在线地址或本地文件 · 已添加 ${records.size} 个"
+                    records.isEmpty() -> "在线地址、本地文件或内置音源"
+                    else -> "在线、本地或内置 · 已添加 ${records.size} 个"
                 },
                 showChevron = records.size < MAX_LX_SOURCES,
             )
@@ -208,13 +212,20 @@ internal fun LxSourcesSettingsScreen(
         LxImportSheet(
             busy = "import" in operations.busy,
             error = operations.errors["import"].orEmpty(),
-            onDismiss = { if ("import" !in operations.busy) importOpen = false },
+            records = records,
+            builtinBusy = operations.busy.filterTo(mutableSetOf()) { it.startsWith("builtin:") },
+            builtinError = operations.errors.filterKeys { it.startsWith("builtin:") }.values.lastOrNull().orEmpty(),
+            onDismiss = {
+                if ("import" !in operations.busy && operations.busy.none { it.startsWith("builtin:") }) importOpen = false
+            },
             onImport = { url -> model.importOnline(url) { importOpen = false } },
             onFile = {
                 replaceId = null
                 filePicker.launch(arrayOf("*/*"))
             },
             onOpenCatalog = { openUri("https://github.com/pdone/lx-music-source") },
+            onImportBuiltin = { model.importBuiltin(it) },
+            onImportAllBuiltin = { model.importAllBuiltin() },
         )
     }
     deleteFor?.let { record ->
@@ -382,10 +393,15 @@ private fun LxSourceDetailSheet(
 private fun LxImportSheet(
     busy: Boolean,
     error: String,
+    records: List<LxSourceRecord>,
+    builtinBusy: Set<String>,
+    builtinError: String,
     onDismiss: () -> Unit,
     onImport: (String) -> Unit,
     onFile: () -> Unit,
     onOpenCatalog: () -> Unit,
+    onImportBuiltin: (LxBuiltinSource) -> Unit,
+    onImportAllBuiltin: () -> Unit,
 ) {
     var mode by rememberSaveable { mutableStateOf("online") }
     var url by rememberSaveable { mutableStateOf("") }
@@ -393,10 +409,10 @@ private fun LxImportSheet(
     AdaptiveSheet(onDismiss = onDismiss, title = "添加自定义音源", subtitle = "兼容落雪音乐移动端 JavaScript 脚本") {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
             ConnectedToggleGroup(
-                options = listOf("online", "local"),
+                options = listOf("online", "local", "builtin"),
                 selected = mode,
                 onSelect = { mode = it },
-                label = { if (it == "online") "在线地址" else "本地文件" },
+                label = { if (it == "online") "在线地址" else if (it == "local") "本地文件" else "内置音源" },
                 modifier = Modifier.fillMaxWidth(),
             )
             Spacer(Modifier.height(16.dp))
@@ -424,7 +440,7 @@ private fun LxImportSheet(
                     if (busy) LoadingIndicator(Modifier.size(20.dp))
                     Text(if (busy) "下载并验证中…" else "下载并导入", Modifier.padding(start = 8.dp))
                 }
-            } else {
+            } else if (mode == "local") {
                 ListRow(
                     title = if (busy) "正在读取并验证…" else "选择 .js 脚本",
                     index = 0,
@@ -437,16 +453,77 @@ private fun LxImportSheet(
                         { LoadingIndicator(Modifier.size(24.dp)) }
                     } else null,
                 )
+            } else {
+                BuiltinSourceList(
+                    records = records,
+                    builtinBusy = builtinBusy,
+                    onImportBuiltin = onImportBuiltin,
+                    onImportAllBuiltin = onImportAllBuiltin,
+                )
             }
-            if (error.isNotBlank()) {
+            val shownError = if (mode == "builtin") builtinError else error
+            if (shownError.isNotBlank()) {
                 Text(
-                    error,
+                    shownError,
                     Modifier.padding(top = 12.dp),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.error,
                 )
             }
             SettingsNote("只导入信任的脚本。脚本可以访问网络，但不会获得 myMusic 保存的平台 Cookie。验证失败不会保存。")
+        }
+    }
+}
+
+@Composable
+private fun BuiltinSourceList(
+    records: List<LxSourceRecord>,
+    builtinBusy: Set<String>,
+    onImportBuiltin: (LxBuiltinSource) -> Unit,
+    onImportAllBuiltin: () -> Unit,
+) {
+    val addedUrls = records.map { it.sourceUrl }.toSet()
+    val full = records.size >= MAX_LX_SOURCES
+    val importingAll = "builtin:all" in builtinBusy
+    val pending = LxBuiltinSources.all.filter { it.url !in addedUrls }
+    SegmentedGroup {
+        LxBuiltinSources.all.forEachIndexed { index, source ->
+            val added = source.url in addedUrls
+            val busy = "builtin:${source.name}" in builtinBusy
+            ListRow(
+                title = source.name,
+                index = index,
+                count = LxBuiltinSources.all.size,
+                onClick = when {
+                    added || busy || importingAll || full -> null
+                    else -> ({ onImportBuiltin(source) })
+                },
+                icon = if (added) Icons.Filled.Check else Icons.Filled.Download,
+                iconTone = if (added) IconTone.Primary else IconTone.Secondary,
+                summary = when {
+                    busy -> "正在下载并验证…"
+                    added -> "已添加 · 在“我的音源”中管理"
+                    full -> "音源已达上限"
+                    else -> "pdone 合集 · ${source.url.substringBeforeLast('/').substringAfterLast('/')}/${source.url.substringAfterLast('/')}"
+                },
+                showChevron = false,
+                trailing = if (busy) {
+                    { LoadingIndicator(Modifier.size(24.dp)) }
+                } else null,
+            )
+        }
+    }
+    if (pending.isNotEmpty() && !full) {
+        Button(
+            onClick = onImportAllBuiltin,
+            enabled = !importingAll && builtinBusy.isEmpty(),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).tvFocusRing().padding(top = 12.dp),
+        ) {
+            if (importingAll) LoadingIndicator(Modifier.size(20.dp))
+            Text(
+                if (importingAll) "正在添加…" else "全部添加（${pending.size} 个）",
+                Modifier.padding(start = 8.dp),
+            )
         }
     }
 }

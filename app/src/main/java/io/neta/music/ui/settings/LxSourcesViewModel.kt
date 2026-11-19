@@ -6,10 +6,13 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.neta.music.MyMusicApp
 import io.neta.music.data.Song
+import io.neta.music.data.lx.LxBuiltinSource
+import io.neta.music.data.lx.LxBuiltinSources
 import io.neta.music.data.lx.LxPlatform
 import io.neta.music.data.lx.LxSourceRecord
 import io.neta.music.data.lx.LxSources
 import io.neta.music.data.lx.LxUpdateNotice
+import io.neta.music.data.lx.MAX_LX_SOURCES
 import io.neta.music.data.lx.MAX_SCRIPT_BYTES
 import io.neta.music.data.lx.decodeUtf8
 import kotlinx.coroutines.CancellationException
@@ -40,8 +43,39 @@ internal class LxSourcesViewModel(application: Application) : AndroidViewModel(a
         viewModelScope.launch { LxSources.updateNotices.collect { mutableNotice.value = it.firstOrNull() } }
     }
 
-    fun importOnline(url: String, onSuccess: () -> Unit) = operate("import", "音源已添加", onSuccess) {
+    fun importOnline(url: String, onSuccess: () -> Unit) = operate("import", "音源已添加", onSuccess, timeoutMs = 600_000) {
         LxSources.importOnline(url)
+    }
+
+    fun importBuiltin(source: LxBuiltinSource, onSuccess: () -> Unit = {}) =
+        operate("builtin:${source.name}", "音源已添加", onSuccess, timeoutMs = 600_000) {
+            LxSources.importOnline(source.url)
+        }
+
+    /** 一键补齐内置音源：跳过已添加项，单个失败继续，结束后汇总结果。 */
+    fun importAllBuiltin(onSuccess: () -> Unit = {}) = operate("builtin:all", "", onSuccess, timeoutMs = 900_000) {
+        var imported = 0
+        var failed = 0
+        for (source in LxBuiltinSources.all) {
+            val records = LxSources.records.value
+            if (records.any { it.sourceUrl == source.url }) continue
+            if (records.size >= MAX_LX_SOURCES) break
+            try {
+                LxSources.importOnline(source.url)
+                imported++
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                failed++
+            }
+        }
+        mutableOperations.update {
+            it.copy(
+                message = if (failed == 0) "已添加 $imported 个内置音源"
+                else "已添加 $imported 个 · $failed 个失败，可稍后重试",
+            )
+        }
+        imported
     }
 
     fun importLocal(uri: Uri, replaceId: String? = null, onSuccess: () -> Unit) =
@@ -50,7 +84,7 @@ internal class LxSourcesViewModel(application: Application) : AndroidViewModel(a
             LxSources.importLocal(script, replaceId)
         }
 
-    fun update(record: LxSourceRecord) = operate("update:${record.id}", "音源已更新") {
+    fun update(record: LxSourceRecord) = operate("update:${record.id}", "音源已更新", timeoutMs = 600_000) {
         LxSources.update(record)
     }
 
@@ -126,7 +160,13 @@ internal class LxSourcesViewModel(application: Application) : AndroidViewModel(a
         decodeUtf8(bytes)
     }
 
-    private fun operate(key: String, successMessage: String, onSuccess: (() -> Unit)? = null, block: suspend () -> Any?) {
+    private fun operate(
+        key: String,
+        successMessage: String,
+        onSuccess: (() -> Unit)? = null,
+        timeoutMs: Long = 120_000,
+        block: suspend () -> Any?,
+    ) {
         if (key in mutableOperations.value.busy) return
         mutableOperations.update {
             val clearTest = key.takeIf { it.startsWith("test:") }?.substringAfter(':')
@@ -139,7 +179,8 @@ internal class LxSourcesViewModel(application: Application) : AndroidViewModel(a
         }
         viewModelScope.launch {
             try {
-                withTimeoutOrNull(120_000) { block() } ?: throw IllegalStateException("操作超时，请稍后重试")
+                // 在线下载会按 CDN 线路逐条回退，最坏远超单次请求时长，导入/更新类操作放宽超时。
+                withTimeoutOrNull(timeoutMs) { block() } ?: throw IllegalStateException("操作超时，请稍后重试")
                 if (key.startsWith("update:")) {
                     mutableOperations.update { it.copy(tests = it.tests - key.substringAfter(':')) }
                 }
