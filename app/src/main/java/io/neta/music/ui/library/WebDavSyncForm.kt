@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.Alignment
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -65,6 +66,7 @@ import io.neta.music.data.webdav.WebDavPaths
 import io.neta.music.ui.ErrorBlock
 import io.neta.music.ui.InfoNote
 import io.neta.music.ui.MusicActions
+import io.neta.music.ui.components.ScanInputIcons
 import io.neta.music.ui.MusicChip
 import io.neta.music.ui.components.SwitchRow
 import io.neta.music.ui.components.tvFocusRing
@@ -240,6 +242,7 @@ internal fun WebDavForm(
         singleLine = true,
         label = { Text("服务器地址") },
         leadingIcon = { Icon(Icons.Filled.Link, null) },
+        trailingIcon = { ScanInputIcons("服务器地址", onValueChange = { form.url = it.trim() }) },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next),
         isError = form.url.isNotBlank() && form.url != form.preset.url && parsedUrl == null,
         supportingText = {
@@ -257,6 +260,7 @@ internal fun WebDavForm(
         singleLine = true,
         label = { Text("用户名") },
         leadingIcon = { Icon(Icons.Filled.Person, null) },
+        trailingIcon = { ScanInputIcons("用户名", onValueChange = { form.username = it }) },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next),
     )
     OutlinedTextField(
@@ -268,11 +272,14 @@ internal fun WebDavForm(
         placeholder = if (reusePassword) ({ Text("已保存，留空沿用") }) else null,
         leadingIcon = { Icon(Icons.Filled.Lock, null) },
         trailingIcon = {
-            IconButton(onClick = { showPassword = !showPassword }) {
-                Icon(
-                    if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                    if (showPassword) "隐藏密码" else "显示密码",
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { showPassword = !showPassword }) {
+                    Icon(
+                        if (showPassword) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                        if (showPassword) "隐藏密码" else "显示密码",
+                    )
+                }
+                ScanInputIcons(form.preset.passwordLabel, onValueChange = { form.password = it })
             }
         },
         visualTransformation = if (showPassword) VisualTransformation.None else PasswordVisualTransformation(),
@@ -290,6 +297,7 @@ internal fun WebDavForm(
         label = { Text("目录") },
         placeholder = { Text(WebDavPaths.DEFAULT_DIRECTORY) },
         leadingIcon = { Icon(Icons.Filled.Folder, null) },
+        trailingIcon = { ScanInputIcons("目录", onValueChange = { form.directory = it }) },
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
         supportingText = { Text("同步文件和上传的歌都放在这个目录下，没有会自动建") },
     )

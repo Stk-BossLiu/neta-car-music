@@ -132,6 +132,7 @@ import io.neta.music.ui.components.AdaptiveSheet
 import io.neta.music.ui.components.IconTone
 import io.neta.music.ui.components.ListRow
 import io.neta.music.ui.components.LocalAppSnackbar
+import io.neta.music.ui.components.ScanInputIcons
 import io.neta.music.ui.components.LocalAppWindow
 import io.neta.music.ui.components.LocalOverlayPadding
 import io.neta.music.ui.components.PageScaffold
@@ -1254,6 +1255,7 @@ private fun LinkImportDialog(isLink: (String) -> Boolean, onImport: (String) -> 
                     supportingText = if (value.isNotBlank() && !valid) ({ Text("没有识别到平台链接") }) else null,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
                     keyboardActions = KeyboardActions(onGo = { submit() }),
+                    trailingIcon = { ScanInputIcons("歌单链接", onValueChange = { value = it }) },
                     modifier = Modifier.fillMaxWidth(),
                 )
             }

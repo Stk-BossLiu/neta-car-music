@@ -1,11 +1,15 @@
 package io.neta.music
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -22,6 +26,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.window.layout.WindowInfoTracker
+import androidx.core.content.ContextCompat
 import io.neta.music.playback.ScreensaverState
 import io.neta.music.ui.components.Fold
 import io.neta.music.ui.components.LocalWindowFold
@@ -42,10 +47,30 @@ class MainActivity : ComponentActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private val fold = MutableStateFlow<Fold?>(null)
 
+    /** 第一次 onStart 紧跟 onCreate（启动和重建都已在 onUiLaunched 里触发过自动播放），跳过。 */
+    private var seenStart = false
+
+    /**
+     * 车机熄火常只是灭屏不杀应用，唤醒不算启动、onCreate 不会来：亮屏补一次自动播放。
+     * 有些车机的灭屏不动 activity 生命周期（不触发 onStart），广播是唯一的信号，所以和 onStart 两条路都留。
+     * 用户自己按的暂停亮屏不接（autoPlayOnReturn 里判断）。
+     */
+    private val screenOn = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == Intent.ACTION_SCREEN_ON) model.autoPlayOnReturn()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // ViewModel 是进程级的，activity 退出后它还在：全新启动时收起上次留下的播放页
         model.onUiLaunched(fresh = savedInstanceState == null)
+        ContextCompat.registerReceiver(
+            this,
+            screenOn,
+            IntentFilter(Intent.ACTION_SCREEN_ON),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
         if (savedInstanceState == null) {
             openWidgetTarget(intent)
             // 桌面上有榜单组件时顺带刷一次榜（上次刷新超过半小时才刷）
@@ -142,7 +167,18 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        lifecycleScope.launch { (application as io.neta.music.MyMusicApp).musicMcp.restoreIfEnabled() }
+        lifecycleScope.launch {
+            val app = application as io.neta.music.MyMusicApp
+            app.musicMcp.restoreIfEnabled()
+            // 安装后的首次启动主线程要忙 dexopt 和首帧，startForegroundService 的 5 秒进前台窗口可能赶不上
+            // （模拟器实测崩过一次）。远控默认开启，晚几秒再拉起避开窗口；扫码入口打开时也会自己拉起。
+            kotlinx.coroutines.delay(3_000)
+            app.remoteControl.restoreIfEnabled()
+        }
+        // 从桌面、别的应用或亮屏回到应用（任务还在、界面没重建）：也算一次打开，接着自动播放。
+        // 用户自己暂停过的回来不自动响（autoPlayOnReturn 里判断）
+        if (seenStart) model.autoPlayOnReturn()
+        seenStart = true
     }
 
     override fun onStop() {
@@ -154,6 +190,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         handler.removeCallbacks(leaveGuard)
+        unregisterReceiver(screenOn)
         super.onDestroy()
     }
 
@@ -175,12 +212,19 @@ class MainActivity : ComponentActivity() {
 
     /** [pauseOnLeave] 里延后的那一下：屏保还盖着就不停，人真去了外面才暂停。 */
     private val leaveGuard = Runnable {
-        // 屏保、息屏还盖着界面：是被它挡住的，音乐接着放。人已经回到应用里（屏保一闪而过）也什么都不做
-        if (ScreensaverState.covered || isFinishing || lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+        // 屏保、息屏还盖着界面：是被它挡住的，音乐接着放。人已经回到应用里（屏保一闪而过）也什么都不做。
+        // SCREEN_OFF 广播可能比这儿还晚到（车机上灭屏走得慢），广播没落地时直接问 PowerManager 屏幕灭没灭，别把息屏当成用户走了
+        if (ScreensaverState.covered ||
+            powerManager?.isInteractive == false ||
+            isFinishing ||
+            lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        ) {
             return@Runnable
         }
         model.onAppBackgrounded(true)
     }
+
+    private val powerManager by lazy { getSystemService(PowerManager::class.java) }
 
     private companion object {
         /** 等屏保的 DREAMING_STARTED 广播落地的时间：那之前看不清是不是屏保盖的。 */

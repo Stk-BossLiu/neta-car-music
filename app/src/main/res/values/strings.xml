@@ -11,6 +11,9 @@
     <string name="mcp_channel">本机 AI 点歌</string>
     <string name="mcp_notification_title">奔奔 AI 点歌已就绪</string>
     <string name="mcp_notification_text">本机 MCP 服务正在等待点歌，可在设置中关闭</string>
+    <string name="remote_channel">手机远控</string>
+    <string name="remote_notification_title">手机远控已就绪</string>
+    <string name="remote_notification_text">同一局域网内可用手机扫码搜歌点歌、传输剪贴板</string>
     <string name="update_download_channel">应用更新下载</string>
     <string name="update_download_title">正在下载吒友爱听更新</string>
     <string name="update_download_ready">吒友爱听更新已下载</string>

@@ -93,7 +93,15 @@ internal class NetaMediaController(private val context: Context, private val han
         ContextCompat.registerReceiver(
             context, receiver, IntentFilter(ACTION_MEDIA_KEY), ContextCompat.RECEIVER_EXPORTED,
         )
-        context.contentResolver.registerContentObserver(Settings.System.getUriFor(MEDIA_MUTE_KEY), false, muteObserver)
+        // 静音键一个音频区一条（VOLUME_GROUP_MUTE/<zoneId>/<groupId>），且按用户分库：这台车主副屏分用户，
+        // 主屏用户只会看到主区键 /0/0（方向盘、主屏面板静音写的），副屏用户只会看到副区键 /1/0（副屏面板
+        // 静音写的），正好各管各区；主屏静音静不到副屏的声音，副屏不跟着暂停也是对的。区号多盯几个是为了
+        // 不做判断：哪个键出现在自己库里都能接住（方控那条 SWC 广播只发主用户，副屏只能靠这儿）。
+        MEDIA_MUTE_KEYS.forEach { key ->
+            context.contentResolver.registerContentObserver(Settings.System.getUriFor(key), false, muteObserver)
+        }
+        val initial = MEDIA_MUTE_KEYS.mapNotNull { key -> readMute(key)?.let { "$key=$it" } }
+        if (initial.isNotEmpty()) AppLog.i("NetaMedia", "静音键初值：${initial.joinToString()}")
         syncMute()
     }
 
@@ -158,13 +166,13 @@ internal class NetaMediaController(private val context: Context, private val han
     }
 
     private fun syncMute() {
-        val muted = runCatching {
-            when (Settings.System.getString(context.contentResolver, MEDIA_MUTE_KEY)) {
-                "1" -> true
-                "0" -> false
-                else -> null
-            }
-        }.getOrNull()
+        // 任一区报静音就按静音算；各区的键都不存在（不是这台车机）时保持未知
+        val values = MEDIA_MUTE_KEYS.map(::readMute)
+        val muted = when {
+            values.any { it == true } -> true
+            values.any { it == false } -> false
+            else -> null
+        }
         isMuted = muted
         // 未知不是解除静音；保留上次有效状态，避免恢复读取后重复执行同一边沿。
         if (muted == null || muted == lastKnownMute) return
@@ -209,10 +217,18 @@ internal class NetaMediaController(private val context: Context, private val han
             }.toSet()
     }
 
+    private fun readMute(key: String): Boolean? = runCatching {
+        when (Settings.System.getString(context.contentResolver, key)) {
+            "1" -> true
+            "0" -> false
+            else -> null
+        }
+    }.getOrNull()
+
     private companion object {
         const val ACTION_MEDIA_KEY = "hozon.intent.action.SWC_MEDIA_KEY"
         const val EXTRA_KEY_CODE = "KeyEvent.keyCode"
-        const val MEDIA_MUTE_KEY = "android.car.VOLUME_GROUP_MUTE/0/0"
+        val MEDIA_MUTE_KEYS = (0..3).map { zone -> "android.car.VOLUME_GROUP_MUTE/$zone/0" }
         val MEDIA_KEYS = setOf(
             KeyEvent.KEYCODE_MEDIA_NEXT, KeyEvent.KEYCODE_MEDIA_PREVIOUS, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
             KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE,

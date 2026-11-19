@@ -182,6 +182,8 @@ class SettingsStore(private val context: Context) {
     private val localMusicKey = stringPreferencesKey("local_music")
     private val mcpEnabledKey = booleanPreferencesKey("mcp_enabled")
     private val mcpBindingKey = stringPreferencesKey("mcp_binding")
+    /** 手机远控（局域网页点歌、剪贴板）的总开关：默认开，关掉后不再随应用自动启动。 */
+    private val remoteEnabledKey = booleanPreferencesKey("remote_enabled")
     private val lastSuccessfulUpdateCdnKey = stringPreferencesKey("last_successful_update_cdn")
     private val dynamicColorKey = booleanPreferencesKey("dynamic_color")
     private val reduceMotionKey = booleanPreferencesKey("reduce_motion")
@@ -276,6 +278,7 @@ class SettingsStore(private val context: Context) {
             }.getOrDefault(LocalMusicSettings()),
             mcpEnabled = values[mcpEnabledKey] ?: false,
             mcpBinding = values[mcpBindingKey] ?: "",
+            remoteEnabled = values[remoteEnabledKey] ?: true,
             lastSuccessfulUpdateCdn = values[lastSuccessfulUpdateCdnKey] ?: "",
             dynamicColor = values[dynamicColorKey] ?: false,
             reduceMotion = values[reduceMotionKey] ?: false,
@@ -338,6 +341,7 @@ class SettingsStore(private val context: Context) {
 
     suspend fun provider(value: String) = context.dataStore.edit { it[providerKey] = value }
     suspend fun mcpEnabled(value: Boolean) = context.dataStore.edit { it[mcpEnabledKey] = value }
+    suspend fun remoteEnabled(value: Boolean) = context.dataStore.edit { it[remoteEnabledKey] = value }
     suspend fun mcpBinding(value: String) = context.dataStore.edit { it[mcpBindingKey] = value }
     suspend fun lastSuccessfulUpdateCdn(value: String) = context.dataStore.edit { it[lastSuccessfulUpdateCdnKey] = value }
     suspend fun chartsSource(value: String) = context.dataStore.edit { it[chartsSourceKey] = value }
@@ -628,6 +632,8 @@ data class AppSettings(
     /** 本机 MCP 服务启用状态及美式最近一次确认的绑定摘要，只保存在本机。 */
     val mcpEnabled: Boolean = false,
     val mcpBinding: String = "",
+    /** 手机远控是否随应用自动启动；默认开。 */
+    val remoteEnabled: Boolean = true,
     val lastSuccessfulUpdateCdn: String = "",
     val dynamicColor: Boolean = false,
     val reduceMotion: Boolean = false,

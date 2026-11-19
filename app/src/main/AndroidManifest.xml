@@ -126,6 +126,14 @@
                 android:value="Local HTTP MCP music control endpoint for the on-device AI assistant" />
         </service>
         <service
+            android:name=".remote.RemoteControlService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local HTTP remote control panel for phone clients on the same LAN" />
+        </service>
+        <service
             android:name=".data.update.UpdateDownloadService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
