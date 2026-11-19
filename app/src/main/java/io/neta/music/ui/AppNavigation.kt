@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
@@ -60,23 +61,31 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlin.coroutines.cancellation.CancellationException
 import io.neta.music.data.TopList
@@ -166,6 +175,8 @@ fun MyMusicApp(model: MusicViewModel) {
     var queueOpen by rememberSaveable { mutableStateOf(false) }
     var timerOpen by rememberSaveable { mutableStateOf(false) }
     var remoteOpen by rememberSaveable { mutableStateOf(false) }
+    // 主界面闲置计时用的交互刻度：任何触摸、回到前台都会加一（见下方的闲置计时 effect）
+    val interaction = remember { mutableStateOf(0) }
 
     fun openTab(tab: String) {
         val currentTab = nav.currentBackStack.value.lastOrNull { entry ->
@@ -252,8 +263,12 @@ fun MyMusicApp(model: MusicViewModel) {
         if (owner != null) selectedTab = owner
     }
 
-    // 每次回到前台都通知一次：从“安装未知来源”设置页授权返回后要靠它继续安装
-    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { model.onAppForeground() }
+    // 每次回到前台都通知一次：从“安装未知来源”设置页授权返回后要靠它继续安装；
+    // 顺便重置闲置计时，后台待的时间不算主界面无操作
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        model.onAppForeground()
+        interaction.value++
+    }
     LaunchedEffect(Unit) {
         // 两个互不相关的收集器合并成一个 effect，少一套协程与 effect 节点
         launch { model.syncEvents.collect { event -> snackbar.showSnackbar(event.message) } }
@@ -322,6 +337,50 @@ fun MyMusicApp(model: MusicViewModel) {
     val enterSpec = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
     val exitSpec = MaterialTheme.motionScheme.fastEffectsSpec<Float>()
 
+    // 自动进入歌词页（和组件的歌词入口同一对动作）：主界面上的起播直接跳，闲置计时到点跳。
+    // 触发时界面正在重组，门条件用 rememberUpdatedState 拿最新的；后台里到点不跳，等回来重新计时。
+    val density = LocalDensity.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    // 软键盘开着（比如停在搜索页输入）不算闲置；IME 边距要在组合里读，转成状态好让下面的流观察到
+    val imeOpen by rememberUpdatedState(WindowInsets.ime.getBottom(density) > 0)
+    val autoLyricsGate by rememberUpdatedState(
+        !covered && !queueOpen && !timerOpen && !remoteOpen &&
+            state.current != null && !window.isTv &&
+            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+    )
+    LaunchedEffect(model) {
+        model.autoLyricsView.collect { wanted ->
+            // 不管跳不跳都先清掉：面板开着、界面在后台时收到的请求不留给旋转重建后的自己
+            if (!wanted) return@collect
+            model.consumeAutoLyrics()
+            if (autoLyricsGate) {
+                model.openPlayer(true)
+                model.requestLyricsView()
+            }
+        }
+    }
+    LaunchedEffect(window, lifecycleOwner) {
+        // 只由真实操作（触摸、导航、回到前台）和条件变化重启计时，进度刷新、界面重组不影响倒计时。
+        // 盖着播放页 / 海报墙、开着面板或软键盘、没在播时都不计时；电视没有这套。
+        // 这里读 backStack 委托而不是 route 局部变量：effect 里捕获的 route 不会跟着返回栈变。
+        snapshotFlow {
+            val currentRoute = backStack?.destination?.route
+            val armable = state.autoLyricsIdle && !state.playerOpen && !state.posterOpen &&
+                state.current != null && state.playing && !queueOpen && !timerOpen && !remoteOpen &&
+                !window.isTv && currentRoute != null && !imeOpen
+            // 时长设置也在流里：改了时长倒计时跟着重来
+            Triple(armable, state.autoLyricsIdleSeconds to interaction.value, currentRoute)
+        }.collectLatest { (armable, watched, _) ->
+            if (armable) {
+                delay(watched.first * 1000L)
+                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                    model.openPlayer(true)
+                    model.requestLyricsView()
+                }
+            }
+        }
+    }
+
     CompositionLocalProvider(
         LocalAppWindow provides window,
         LocalAppSnackbar provides snackbar,
@@ -332,7 +391,20 @@ fun MyMusicApp(model: MusicViewModel) {
         val shellSurface = MaterialTheme.colorScheme.surface
         SharedTransitionLayout(Modifier.fillMaxSize().drawBehind { drawRect(pageChrome.scheme?.surface ?: shellSurface) }) {
         CompositionLocalProvider(LocalSharedTransitionScope provides this) {
-        Box(Modifier.fillMaxSize()) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                // Initial 通道只观察不拦截：窗口里（主界面、播放页、海报墙）的任何触摸都
+                // 算一次操作，重置主界面闲置进歌词页的计时；面板是单独窗口，由开门条件拦住
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            awaitPointerEvent(PointerEventPass.Initial)
+                            interaction.value++
+                        }
+                    }
+                }
+        ) {
             // 手机横屏（≥600dp 走平板布局）时导航栏、挖孔在左右两侧，内容不能伸到下面
             Row(
                 Modifier

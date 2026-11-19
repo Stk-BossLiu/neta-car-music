@@ -223,6 +223,10 @@ data class MusicUiState(
     /** 冷启动打开的顶层入口（TopTab.route），空表示还没读到设置。 */
     val startupTab: String = "",
     val autoPlayOnLaunch: Boolean = true,
+    /** 主界面无操作自动进歌词页：闲置计时和起播跳转共用这一个开关。 */
+    val autoLyricsIdle: Boolean = true,
+    /** 主界面多少秒无操作后自动进歌词页。 */
+    val autoLyricsIdleSeconds: Int = 30,
     /** 歌单页上次用的浏览方式；还没读到设置时是默认的「推荐」。 */
     val playlistsMode: PlaylistMode = PlaylistMode.Recommend,
     /** 听歌模式页上次选的分组，空表示「全部」。 */
@@ -400,6 +404,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     /** 自己刚调的 pause（离开应用自动暂停）：别被 onPlayWhenReadyChanged 当成用户按的暂停清掉账。 */
     private var autoPauseInFlight = false
+    /** 这之前收到的起播是应用自发的接续（启动自动播放、回前台续播），不算「主界面起播进歌词页」。 */
+    private var autoLyricsSuppressUntil = 0L
 
     /** 界面（MainActivity）打开过。组件、系统媒体控件拉起进程时不读榜单、不检查更新，等界面真正打开。 */
     private val uiLaunched = MutableStateFlow(false)
@@ -417,6 +423,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     /** 打开播放页时直接切到歌词视图（组件的歌词区域）。 */
     val lyricsViewRequest: StateFlow<Boolean> = _lyricsView.asStateFlow()
+    private val _autoLyrics = MutableStateFlow(false)
+
+    /**
+     * 主界面上的起播（暂停→播放，含方向盘、语音这类外部控制）要直接进歌词页。
+     * 界面消费后清空：旋转重建、晚订阅拿到的都是「无请求」，不会拿旧值再跳一次。
+     */
+    val autoLyricsView: StateFlow<Boolean> = _autoLyrics.asStateFlow()
     private val _searchRequest = MutableStateFlow<SearchRequest?>(null)
     val searchRequest: StateFlow<SearchRequest?> = _searchRequest.asStateFlow()
     private var loginJob: Job? = null
@@ -584,6 +597,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             playlistsSource = settings.playlistsSource,
             startupTab = settings.startupTab,
             autoPlayOnLaunch = settings.autoPlayOnLaunch,
+            autoLyricsIdle = settings.autoLyricsIdle,
+            autoLyricsIdleSeconds = settings.autoLyricsIdleSeconds,
             playlistsMode = settings.playlistsMode.toPlaylistMode(),
             listenGroup = settings.listenGroup.ifBlank { "全部" },
             theme = settings.theme,
@@ -3994,7 +4009,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 _recognition.value = recognitionError(error.message ?: "录音失败")
                 return@launch
             } finally {
-                if (wasPlaying) controller?.play()
+                if (wasPlaying) {
+                    // 识曲录完把音乐接回去不算新起播，别因此把人拉进歌词页
+                    autoLyricsSuppressUntil = SystemClock.elapsedRealtime() + AUTO_LYRICS_SUPPRESS_MS
+                    controller?.play()
+                }
             }
             if (!isActive) return@launch
 
@@ -4703,6 +4722,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 interruptedBySystem = false
                 // 用户自己按的播放：断流重连的次数重新算
                 liveRetryCount = 0
+                // 暂停→播放（方向盘、语音、耳机这些外部控制也一样）在主界面上时直接进歌词页
+                if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST) maybeAutoLyricsView()
                 return
             }
             // 离开应用时的自动暂停：账在 onAppBackgrounded 里已经记了，别当成用户按的暂停清掉
@@ -5627,6 +5648,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             if (player.playWhenReady) return@launch
             // interruptedBySystem 记着最近一次暂停是谁按的：只有被系统打断的回来才接
             if (respectUserPause && !interruptedBySystem) return@launch
+            // 自动接续不算用户起播，别让它触发「主界面起播进歌词页」
+            autoLyricsSuppressUntil = SystemClock.elapsedRealtime() + AUTO_LYRICS_SUPPRESS_MS
             if (dormant != null && player.mediaItemCount == 0) {
                 launchResume()
             } else if (player.mediaItemCount > 0) {
@@ -5653,6 +5676,22 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun consumeLyricsView() {
         _lyricsView.value = false
+    }
+
+    /**
+     * 起播要进歌词页时先过这道闸：界面没起、应用自发的接续（[autoLyricsSuppressUntil]）、
+     * 播放页或海报墙已经盖在主界面上（应用内点歌本来就会开播放页）、没歌在放、设置关了都不算。
+     */
+    private fun maybeAutoLyricsView() {
+        if (!uiLaunched.value || SystemClock.elapsedRealtime() < autoLyricsSuppressUntil) return
+        val ui = base.value
+        if (ui.playerOpen || ui.posterOpen || ui.current == null) return
+        if (!settingsState.value.autoLyricsIdle) return
+        _autoLyrics.value = true
+    }
+
+    fun consumeAutoLyrics() {
+        _autoLyrics.value = false
     }
 
     fun requestSearch(request: SearchRequest) {
@@ -5949,6 +5988,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setStartupTab(route: String) = viewModelScope.launch { app.settings.startupTab(route) }
     fun setAutoPlayOnLaunch(value: Boolean) = viewModelScope.launch { app.settings.autoPlayOnLaunch(value) }
+    fun setAutoLyricsIdle(value: Boolean) = viewModelScope.launch { app.settings.autoLyricsIdle(value) }
+    fun setAutoLyricsIdleSeconds(value: Int) = viewModelScope.launch { app.settings.autoLyricsIdleSeconds(value) }
 
     /**
      * 音乐源开关。关掉的平台从启用列表和优先列表里一起消失：聚合搜索、来源条、换源都不再用它，
@@ -6459,6 +6500,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (app.carMedia?.let { it.isMuted == true || it.isPausedForMute } == true) return
         if (!isTvLayout()) return
         val player = controller?.takeIf { it.mediaItemCount > 0 && !it.isPlaying } ?: return
+        // 回前台自动续播同启动自动播放一样，不算用户起播
+        autoLyricsSuppressUntil = SystemClock.elapsedRealtime() + AUTO_LYRICS_SUPPRESS_MS
         player.play()
     }
 
@@ -6588,6 +6631,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val BROWSE_CACHE_MS = 10L * 60 * 1000
+
+        /** 自动接续播放后这段时间内的起播不算「主界面起播进歌词页」（给接续的 play() 事件留的窗口）。 */
+        const val AUTO_LYRICS_SUPPRESS_MS = 4_000L
 
         /** 授权页最多打开两次还装不上，就认定这台设备走不通那条路，转手动安装。 */
         const val MAX_INSTALL_PERMISSION_ATTEMPTS = 2

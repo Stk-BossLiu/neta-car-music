@@ -214,6 +214,9 @@ class SettingsStore(private val context: Context) {
     private val crossfadeSecondsKey = intPreferencesKey("crossfade_seconds")
     private val crossfadeAnimationKey = stringPreferencesKey("crossfade_animation")
     private val crossfadeModeKey = stringPreferencesKey("crossfade_mode")
+    /** 主界面长时间无操作且在播放时自动进入歌词页；闲置多少秒算“长时间无操作”见 [autoLyricsIdleSecondsKey]。 */
+    private val autoLyricsIdleKey = booleanPreferencesKey("auto_lyrics_idle")
+    private val autoLyricsIdleSecondsKey = intPreferencesKey("auto_lyrics_idle_seconds")
     private val cacheLimitKey = intPreferencesKey("cache_limit_mb")
     private val lyricsBackgroundKey = stringPreferencesKey("lyrics_background")
     private val notificationLyricsKey = booleanPreferencesKey("notification_lyrics")
@@ -344,6 +347,8 @@ class SettingsStore(private val context: Context) {
             crossfadeSeconds = (values[crossfadeSecondsKey] ?: 6).coerceIn(4, 10),
             crossfadeAnimation = values[crossfadeAnimationKey] ?: CrossfadeAnimation.Ring.name,
             crossfadeMode = values[crossfadeModeKey] ?: CrossfadeMode.Automix.name,
+            autoLyricsIdle = values[autoLyricsIdleKey] ?: true,
+            autoLyricsIdleSeconds = (values[autoLyricsIdleSecondsKey] ?: 30).coerceIn(15, 120),
             cacheLimitMb = values[cacheLimitKey] ?: 0,
         )
     }
@@ -414,6 +419,8 @@ class SettingsStore(private val context: Context) {
         context.dataStore.edit { it[crossfadeAnimationKey] = value.name }
     suspend fun crossfadeMode(value: CrossfadeMode) =
         context.dataStore.edit { it[crossfadeModeKey] = value.name }
+    suspend fun autoLyricsIdle(value: Boolean) = context.dataStore.edit { it[autoLyricsIdleKey] = value }
+    suspend fun autoLyricsIdleSeconds(value: Int) = context.dataStore.edit { it[autoLyricsIdleSecondsKey] = value.coerceIn(15, 120) }
     suspend fun cacheLimitMb(value: Int) = context.dataStore.edit { it[cacheLimitKey] = value }
 
     /** 墙内设置：在同一次 edit 里读出当前值再写回，连着点两个开关也不会互相覆盖。 */
@@ -722,6 +729,10 @@ data class AppSettings(
     val crossfadeAnimation: String = "Ring",
     /** 交叉淡化还是智能过渡，见 [CrossfadeMode]。 */
     val crossfadeMode: String = "Automix",
+    /** 主界面无操作自动进歌词页的总开关：闲置计时和起播跳转都由它控制。 */
+    val autoLyricsIdle: Boolean = true,
+    /** 主界面多少秒无操作后自动进歌词页。 */
+    val autoLyricsIdleSeconds: Int = 30,
     /** 播放缓存上限（MB），0 表示按设备默认：电视 256，其他 512。 */
     val cacheLimitMb: Int = 0,
 )

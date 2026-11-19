@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.QrCode2
@@ -575,6 +576,30 @@ internal fun PlaybackSettingsScreen(
                 summary = "打开应用后，从上次的歌曲和进度继续播放",
                 icon = Icons.Filled.MusicNote,
             )
+        }
+        item(key = "autoLyricsHead", contentType = "sectionHeader") { SectionLabel("自动进入歌词页") }
+        item(key = "autoLyricsSwitch", contentType = "switch") {
+            SwitchRow(
+                title = "自动进入歌词页",
+                checked = state.autoLyricsIdle,
+                onCheckedChange = actions::setAutoLyricsIdle,
+                index = 0,
+                count = 1,
+                summary = "播放中在主界面长时间不操作，或在主界面上开始播放（方向盘、语音这类控制也一样）时，自动打开歌词页",
+                icon = Icons.Filled.Lyrics,
+            )
+        }
+        if (state.autoLyricsIdle) {
+            item(key = "autoLyricsSecondsHead", contentType = "sectionHeader") { SectionLabel("无操作时长") }
+            item(key = "autoLyricsSeconds", contentType = "toggleGroup") {
+                ConnectedToggleGroup(
+                    options = listOf(15, 30, 60, 120),
+                    selected = state.autoLyricsIdleSeconds,
+                    onSelect = { actions.setAutoLyricsIdleSeconds(it) },
+                    label = { if (it >= 60) "${it / 60} 分钟" else "$it 秒" },
+                    modifier = Modifier.widthIn(max = 480.dp).fillMaxWidth(),
+                )
+            }
         }
         item(key = "crossHead", contentType = "sectionHeader") { SectionLabel("切歌过渡") }
         item(key = "crossSwitch", contentType = "switch") {
