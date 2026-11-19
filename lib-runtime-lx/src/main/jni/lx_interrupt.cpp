@@ -32,7 +32,7 @@ int onInterrupt(JSRuntime *, void *opaque) {
 } // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_com_mytv_mymusic_lxruntime_LxQuickJsInterrupt_install(JNIEnv *, jclass, jlong runtime) {
+Java_io_neta_music_lxruntime_LxQuickJsInterrupt_install(JNIEnv *, jclass, jlong runtime) {
     SetInterruptHandler setter = findSetter();
     if (setter == nullptr || runtime == 0) return 0;
     auto *state = new (std::nothrow) InterruptState{reinterpret_cast<JSRuntime *>(runtime)};
@@ -44,7 +44,7 @@ Java_com_mytv_mymusic_lxruntime_LxQuickJsInterrupt_install(JNIEnv *, jclass, jlo
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_mytv_mymusic_lxruntime_LxQuickJsInterrupt_interrupt(JNIEnv *, jclass, jlong handle) {
+Java_io_neta_music_lxruntime_LxQuickJsInterrupt_interrupt(JNIEnv *, jclass, jlong handle) {
     std::lock_guard<std::mutex> lock(stateMutex);
     auto *state = reinterpret_cast<InterruptState *>(handle);
     if (activeStates.find(state) != activeStates.end()) {
@@ -53,7 +53,7 @@ Java_com_mytv_mymusic_lxruntime_LxQuickJsInterrupt_interrupt(JNIEnv *, jclass, j
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_mytv_mymusic_lxruntime_LxQuickJsInterrupt_release(JNIEnv *, jclass, jlong handle) {
+Java_io_neta_music_lxruntime_LxQuickJsInterrupt_release(JNIEnv *, jclass, jlong handle) {
     SetInterruptHandler setter = findSetter();
     std::lock_guard<std::mutex> lock(stateMutex);
     auto *state = reinterpret_cast<InterruptState *>(handle);
