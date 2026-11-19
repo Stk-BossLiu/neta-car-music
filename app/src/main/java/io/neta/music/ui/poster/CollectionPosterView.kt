@@ -25,7 +25,6 @@ import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.PlayArrow
@@ -87,6 +86,7 @@ import io.neta.music.ui.MusicActions
 import io.neta.music.ui.MusicUiState
 import io.neta.music.ui.adaptive.foldAnchor
 import io.neta.music.ui.charts.TvDefaultFocus
+import io.neta.music.ui.components.BackButton
 import io.neta.music.ui.components.DeviceKind
 import io.neta.music.ui.components.LocalAppWindow
 import io.neta.music.ui.components.LocalOverlayPadding
@@ -548,9 +548,7 @@ private fun TitlePill(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (onBack != null) {
-                IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
-                }
+                BackButton(onClick = onBack, size = 40.dp)
                 Spacer(Modifier.width(4.dp))
             }
             Column(

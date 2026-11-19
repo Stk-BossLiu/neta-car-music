@@ -14,11 +14,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
@@ -78,9 +73,7 @@ fun PageScaffold(
     )
     val navigation: @Composable () -> Unit = {
         if (onBack != null) {
-            IconButton(onClick = onBack, modifier = Modifier.tvFocusRing(CircleShape)) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
-            }
+            BackButton(onClick = onBack, size = 48.dp)
         }
     }
     Scaffold(
@@ -163,9 +156,7 @@ private fun TvPageHeader(title: String, subtitle: String, onBack: (() -> Unit)?,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         if (onBack != null) {
-            IconButton(onClick = onBack, modifier = Modifier.tvFocusRing(CircleShape)) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
-            }
+            BackButton(onClick = onBack, size = 48.dp)
         }
         Column(Modifier.weight(1f)) {
             Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)

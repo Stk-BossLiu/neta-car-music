@@ -24,7 +24,6 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Tune
@@ -69,6 +68,7 @@ import io.neta.music.ui.MusicUiState
 import io.neta.music.ui.adaptive.foldAnchor
 import io.neta.music.ui.charts.SongAction
 import io.neta.music.ui.charts.SongActionsSheet
+import io.neta.music.ui.components.BackButton
 import io.neta.music.ui.components.LocalAppSnackbar
 import io.neta.music.ui.components.LocalAppWindow
 import io.neta.music.ui.components.LocalSharedTransitionScope
@@ -490,9 +490,7 @@ private fun WallTitlePill(title: String, subtitle: String, onBack: (() -> Unit)?
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (onBack != null) {
-                IconButton(onClick = onBack, modifier = Modifier.size(40.dp).tvFocusRing(CircleShape)) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "关闭海报墙")
-                }
+                BackButton(onClick = onBack, label = "关闭海报墙", size = 40.dp)
             }
             Column {
                 Text(

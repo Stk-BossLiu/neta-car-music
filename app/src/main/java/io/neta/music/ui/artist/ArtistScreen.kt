@@ -38,7 +38,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.MusicNote
@@ -111,6 +110,7 @@ import io.neta.music.ui.charts.SongActionsSheet
 import io.neta.music.ui.charts.TvDefaultFocus
 import io.neta.music.ui.charts.rememberCoverTint
 import io.neta.music.ui.components.AppLoading
+import io.neta.music.ui.components.BackButton
 import io.neta.music.ui.components.ConnectedToggleGroup
 import io.neta.music.ui.components.LocalAppWindow
 import io.neta.music.ui.components.LocalOverlayPadding
@@ -251,7 +251,6 @@ private fun PhoneArtist(
                 if (collapsed) MaterialTheme.colorScheme.surfaceContainer else Color.Transparent,
                 label = "artistBar",
             )
-            val iconColor = if (collapsed || photo.isBlank()) MaterialTheme.colorScheme.onSurface else Color.White
             TopAppBar(
                 title = {
                     AnimatedVisibility(collapsed, enter = fadeIn(), exit = fadeOut()) {
@@ -259,7 +258,7 @@ private fun PhoneArtist(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = iconColor) }
+                    BackButton(onClick = onBack, size = 48.dp)
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = barColor),
             )
@@ -453,9 +452,7 @@ private fun TwoPaneArtist(
                         .padding(bottom = LocalFoldPane.current.bottom(overlay + 24.dp)),
                 ) {
                     if (!tv) {
-                        IconButton(onClick = onBack, modifier = Modifier.padding(bottom = 8.dp)) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
-                        }
+                        BackButton(onClick = onBack, size = 48.dp, modifier = Modifier.padding(bottom = 8.dp))
                     }
                     ArtistPortrait(artist, tint, if (tv) 200.dp else 232.dp)
                     Spacer(Modifier.height(20.dp))

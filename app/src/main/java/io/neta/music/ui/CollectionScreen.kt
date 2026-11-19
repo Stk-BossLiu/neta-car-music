@@ -30,7 +30,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.CheckCircle
@@ -71,6 +70,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import io.neta.music.ui.components.BackButton
 import io.neta.music.ui.components.TintedGradient
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.graphicsLayer
@@ -437,7 +437,7 @@ private fun PhoneCollection(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回") }
+                    BackButton(onClick = onBack, size = 48.dp)
                 },
                 actions = {
                     ops.openPlaybackSettings?.let { open ->
@@ -580,9 +580,7 @@ private fun TwoPaneCollection(
                         .padding(bottom = LocalFoldPane.current.bottom(overlay + 24.dp)),
                 ) {
                     if (!tv) {
-                        IconButton(onClick = onBack, modifier = Modifier.padding(bottom = 8.dp)) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
-                        }
+                        BackButton(onClick = onBack, size = 48.dp, modifier = Modifier.padding(bottom = 8.dp))
                     }
                     if (isAlbum) {
                         VinylCover(collection.cover, collection.title, if (tv) 200.dp else 224.dp, albumSpinning, tint)

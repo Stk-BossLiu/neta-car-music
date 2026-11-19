@@ -92,6 +92,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.neta.music.ui.LyricLine
 import io.neta.music.ui.ParsedLyrics
+import io.neta.music.ui.components.BackButton
 import io.neta.music.ui.components.distinctKeys
 import io.neta.music.ui.components.tvFocusRing
 import io.neta.music.ui.theme.LocalAppearance
@@ -103,20 +104,10 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
-/** 播放页左上角返回键：64dp 圆形按钮，兼顾横屏触摸和窄屏操作。 */
+/** 播放页左上角返回键：64dp 圆形按钮，兼顾横屏触摸和窄屏操作。样式实现见 [BackButton]。 */
 @Composable
 fun PlayerBackButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
-    FilledIconButton(
-        onClick = onClick,
-        modifier = modifier.size(64.dp).tvFocusRing(CircleShape),
-        shape = CircleShape,
-        colors = IconButtonDefaults.filledIconButtonColors(
-            containerColor = MaterialTheme.colorScheme.onSurface,
-            contentColor = MaterialTheme.colorScheme.surface,
-        ),
-    ) {
-        Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, "收起播放页", Modifier.size(36.dp))
-    }
+    BackButton(onClick, modifier, label = "收起播放页")
 }
 
 /** 控件 4 秒无操作后隐藏，播放和暂停一样。任意按下或按键唤醒；电视上唤醒的那一下不触发按键动作。 */

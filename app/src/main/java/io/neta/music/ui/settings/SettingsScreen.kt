@@ -19,10 +19,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -56,12 +54,12 @@ import io.neta.music.playback.EqPresets
 import io.neta.music.playback.EqualizerUiState
 import io.neta.music.ui.MusicUiState
 import io.neta.music.ui.adaptive.FoldRow
+import io.neta.music.ui.components.BackButton
 import io.neta.music.ui.components.ListRow
 import io.neta.music.ui.components.LocalAppWindow
 import io.neta.music.ui.components.LocalOverlayPadding
 import io.neta.music.ui.components.PageScaffold
 import io.neta.music.ui.components.SegmentedGroup
-import io.neta.music.ui.components.tvFocusRing
 import io.neta.music.ui.formatBytes
 import io.neta.music.ui.player.label
 import io.neta.music.ui.player.stage.ClassicVisualizer
@@ -321,12 +319,12 @@ private fun DetailHeader(section: SettingsSection, onBack: (() -> Unit)?, backFo
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (onBack != null) {
-            IconButton(
+            BackButton(
                 onClick = onBack,
-                modifier = Modifier.focusRequester(backFocus).tvFocusRing(CircleShape),
-            ) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回${section.parent?.title.orEmpty()}")
-            }
+                label = "返回${section.parent?.title.orEmpty()}",
+                size = 48.dp,
+                modifier = Modifier.focusRequester(backFocus),
+            )
         }
         Column(Modifier.weight(1f).padding(start = 4.dp)) {
             Text(
