@@ -1,0 +1,1 @@
+-keep class io.neta.music.lxruntime.LxQuickJsInterrupt { *; }

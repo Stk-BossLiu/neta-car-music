@@ -34,6 +34,7 @@ internal class RemoteControlServer(private val app: MyMusicApp) : NanoHTTPD(null
             session.method == Method.GET && uri == "/api/search" -> search(session)
             session.method == Method.POST && uri == "/api/play" -> withBody(session, ::play)
             session.method == Method.POST && uri == "/api/request" -> withBody(session, ::request)
+            session.method == Method.POST && uri == "/api/import" -> withBody(session, ::importPlaylist)
             session.method == Method.POST && uri == "/api/transport" -> transport()
             session.method == Method.GET && uri == "/api/clipboard" -> clipboardGet()
             session.method == Method.POST && uri == "/api/clipboard" -> withBody(session, ::clipboardSet)
@@ -57,6 +58,10 @@ internal class RemoteControlServer(private val app: MyMusicApp) : NanoHTTPD(null
         val snapshot = WidgetHub.playback.value
         val song = snapshot?.song
         val cover = song?.cover.orEmpty()
+        // 能解析歌单的平台列表：网页导入裸 ID 时选平台用（静态小字段，随状态一起给）
+        val providers = JSONArray()
+        runCatching { app.musicViewModel.providersForRemoteImport() }.getOrDefault(emptyList())
+            .forEach { (id, name) -> providers.put(JSONObject().put("id", id).put("name", name)) }
         val body = JSONObject()
             .put("playing", snapshot?.playing == true)
             .put("title", song?.title.orEmpty())
@@ -67,6 +72,7 @@ internal class RemoteControlServer(private val app: MyMusicApp) : NanoHTTPD(null
             .put("cover", if (cover.startsWith("http")) cover else "")
             .put("source", snapshot?.sourceName.orEmpty())
             .put("quality", snapshot?.quality.orEmpty())
+            .put("providers", providers)
         return jsonResponse(body)
     }
 
@@ -137,6 +143,30 @@ internal class RemoteControlServer(private val app: MyMusicApp) : NanoHTTPD(null
                     if (success) "已点播" else reply.getString("message").orEmpty()
                         .ifBlank { "暂时放不了，稍后再试" },
                 ),
+        )
+    }
+
+    /** 手机远控网页的导入歌单：分享链接自动按域名定平台，裸 ID 由网页选好平台传上来。 */
+    private fun importPlaylist(body: JSONObject): Response {
+        val text = body.optString("text").trim()
+        if (text.isEmpty()) {
+            return json(Response.Status.BAD_REQUEST, JSONObject().put("success", false).put("message", "导入内容不能为空"))
+        }
+        val provider = body.optString("provider").trim().ifBlank { null }
+        val result = runCatching {
+            runBlocking { withContext(Dispatchers.Main) { app.musicViewModel.importForRemote(text, provider) } }
+        }.getOrElse { error ->
+            return json(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().put("success", false).put("message", error.message ?: "导入失败，请稍后再试"),
+            )
+        }
+        return jsonResponse(
+            JSONObject()
+                .put("success", result.success)
+                .put("title", result.title)
+                .put("count", result.count)
+                .put("message", result.message),
         )
     }
 

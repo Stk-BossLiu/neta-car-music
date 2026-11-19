@@ -34,6 +34,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Album
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
@@ -98,6 +100,7 @@ import io.neta.music.aggregate.TrackSource
 import io.neta.music.aggregate.availabilityOf
 import io.neta.music.data.CrossfadeAnimation
 import io.neta.music.data.CrossfadeMode
+import io.neta.music.data.native.AudioQuality
 import io.neta.music.data.DownloadRecord
 import io.neta.music.data.MiniPlayerTarget
 import io.neta.music.data.SearchKind
@@ -129,6 +132,17 @@ class MusicActions(private val model: MusicViewModel) {
     fun openPlaylist(playlist: io.neta.music.data.Playlist, album: Boolean = false) = model.openPlaylist(playlist, album)
 
     fun openArtist(playlist: io.neta.music.data.Playlist) = model.openArtist(playlist)
+    /** 歌手页的专辑卡片、专辑页的“更多专辑”。 */
+    fun openAlbum(album: io.neta.music.data.AlbumSummary) = model.openAlbum(album)
+    /** 歌曲上的歌手名 → 歌手页；[song] 决定先在哪个平台上找。 */
+    fun openArtistByName(name: String, song: Song? = null) = model.openArtistByName(name, song)
+    /** 歌曲 → 它所在的专辑页。 */
+    fun openAlbumOf(song: Song) = model.openAlbumOf(song)
+    fun retryArtist(key: String) = model.retryArtist(key)
+    fun loadMoreArtistAlbums(key: String) = model.loadMoreArtistAlbums(key)
+    fun playArtist(key: String, shuffle: Boolean = false) = model.playArtist(key, shuffle)
+    fun queueArtist(key: String) = model.queueArtist(key)
+    fun saveArtistSongs(key: String) = model.saveArtistSongs(key)
     fun playCollection(openPlayer: Boolean = true) = model.playCollection(openPlayer)
     fun saveCollection() = model.saveCollectionToLibrary()
     fun retryCollection() = model.retryCollection()
@@ -219,6 +233,8 @@ class MusicActions(private val model: MusicViewModel) {
     fun clearPlayHistory() = model.clearPlayHistory()
     fun restoreSaved(songs: List<io.neta.music.data.SavedSong>) = model.restoreSavedSongs(songs)
     fun importLink(link: String) = model.openLink(link)
+    /** 显式导入歌单：分享链接自动按域名定平台，直接输入的歌单 ID 配合选定的平台。 */
+    fun importPlaylist(text: String, providerId: String?) = model.importPlaylist(text, providerId)
 
     fun selectProvider(id: String) = model.selectProvider(id)
     fun setTheme(value: String) = model.selectTheme(value)
@@ -236,6 +252,8 @@ class MusicActions(private val model: MusicViewModel) {
     fun setLyricsAlignment(value: io.neta.music.ui.theme.LyricsAlignment) = model.setLyricsAlignment(value)
     fun setLyricsBackground(value: io.neta.music.data.LyricsBackgroundMode) = model.setLyricsBackground(value)
     fun setNotificationLyrics(value: Boolean) = model.setNotificationLyrics(value)
+    fun setLyriconProviderEnabled(value: Boolean) = model.setLyriconProviderEnabled(value)
+    fun setLyriconSubscriberEnabled(value: Boolean) = model.setLyriconSubscriberEnabled(value)
     fun setRhythmIntensity(value: io.neta.music.data.RhythmIntensity) = model.setRhythmIntensity(value)
     fun setCoverShape(value: io.neta.music.data.CoverShapeChoice) = model.setCoverShape(value)
     fun setTvAmbientClock(value: Boolean) = model.setTvAmbientClock(value)
@@ -265,6 +283,7 @@ class MusicActions(private val model: MusicViewModel) {
     fun setCrossfadeMode(value: CrossfadeMode) = model.setCrossfadeMode(value)
     fun setReduceMotion(value: Boolean) = model.setReduceMotion(value)
     fun setVolumeNormalization(value: Boolean) = model.setVolumeNormalization(value)
+    fun setAudioQuality(value: AudioQuality) = model.setAudioQuality(value)
     fun toggleAggregateProvider(id: String) = model.toggleAggregateProvider(id)
     fun moveSource(id: String, delta: Int) = model.moveSource(id, delta)
     fun resetSources() = model.resetSources()
@@ -282,6 +301,8 @@ class MusicActions(private val model: MusicViewModel) {
     fun setCacheLimit(mb: Int) = model.setCacheLimit(mb)
     fun startLogin(providerId: String, type: String = "qq") = model.startLogin(providerId, type)
     fun saveCookie(providerId: String, cookie: String) = model.saveCookie(providerId, cookie)
+    fun loginWithPassword(providerId: String, username: String, password: String) =
+        model.loginWithPassword(providerId, username, password)
     fun saveSodaSigner(url: String, token: String, enabled: Boolean = true) =
         model.saveSodaSigner(url, token, enabled)
 
@@ -604,6 +625,14 @@ fun TrackActionsSheet(
      * （歌曲信息只在本地音乐页里），选好的匹配记进线索表并同步回有文件的设备。非本地歌为 null。
      */
     onRematch: (() -> Unit)? = null,
+    /** “查看歌手：某某”，每位歌手一行（最多 3 位）；参数是点的那位歌手名。 */
+    onOpenArtist: ((String) -> Unit)? = null,
+    /** “查看专辑：某某”。歌曲没有专辑名时不显示。 */
+    onOpenAlbum: (() -> Unit)? = null,
+    /** 已经在这位歌手的页面里：不再给他自己那一行。 */
+    hideArtist: String = "",
+    /** 已经在这张专辑的页面里：不给“查看专辑”。 */
+    hideAlbum: String = "",
 ) {
     var showPlaylists by remember { mutableStateOf(false) }
     io.neta.music.ui.components.AdaptiveSheet(
@@ -621,7 +650,23 @@ fun TrackActionsSheet(
                     QuickAction(Icons.Filled.LibraryAdd, "加到歌单", false, Modifier.weight(1f), enabled = playlists.isNotEmpty()) { showPlaylists = true }
                 }
                 Spacer(Modifier.height(12.dp))
-                val rows = listOfNotNull(
+                // 直播（电台）没有歌手 / 专辑可看
+                val browsable = !song.isLive
+                val hiddenArtist = io.neta.music.aggregate.TrackNormalizer.keyOf(hideArtist)
+                val artistRows = if (onOpenArtist == null || !browsable) {
+                    emptyList()
+                } else {
+                    io.neta.music.ui.artist.splitArtistNames(song.artist)
+                        .filter { hiddenArtist.isEmpty() || io.neta.music.aggregate.TrackNormalizer.keyOf(it) != hiddenArtist }
+                        .take(3)
+                        .map { name -> SheetRow(Icons.Filled.Person, "查看歌手：$name", false) { onOpenArtist(name) } }
+                }
+                val albumRow = onOpenAlbum?.takeIf {
+                    browsable && song.album.isNotBlank() &&
+                        io.neta.music.aggregate.TrackNormalizer.keyOf(song.album) != io.neta.music.aggregate.TrackNormalizer.keyOf(hideAlbum)
+                }?.let { SheetRow(Icons.Filled.Album, "查看专辑：${song.album}", false, it) }
+                val rows = artistRows + listOfNotNull(
+                    albumRow,
                     onRematch?.let { SheetRow(Icons.Filled.FindReplace, "换一个匹配", false, it) },
                     onOpenSource?.let { SheetRow(Icons.Filled.SwapHoriz, "选择音源 / 查看其他版本", false, it) },
                     onMerge?.let { SheetRow(Icons.AutoMirrored.Filled.CallMerge, "合并到…", false, it) },
@@ -873,6 +918,10 @@ fun providerMark(name: String): String = when {
     name.contains("5sing", ignoreCase = true) -> "5sing"
     name.contains("Jamendo", ignoreCase = true) -> "Jam"
     name.contains("JOOX", ignoreCase = true) -> "JOOX"
+    name.contains("Spotify", ignoreCase = true) -> "Spotify"
+    name.contains("YouTube", ignoreCase = true) -> "YT"
+    name.contains("MHub", ignoreCase = true) || name.contains("op.wiki", ignoreCase = true) -> "op.wiki"
+    name.contains("洛雪") -> "洛雪"
     else -> name.take(2)
 }
 
@@ -889,6 +938,10 @@ fun providerName(providers: List<io.neta.music.data.ProviderInfo>, id: String): 
         "joox" -> "JOOX"
         "fivesing" -> "5sing"
         "qianqian" -> "千千音乐"
+        "spotify" -> "Spotify"
+        "youtubemusic" -> "YouTube Music"
+        "mhub" -> "music.op.wiki"
+        "lx" -> "洛雪音源"
         "local" -> "本地"
         else -> id
     }

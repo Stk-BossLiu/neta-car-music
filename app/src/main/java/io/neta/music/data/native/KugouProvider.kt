@@ -1,5 +1,10 @@
 package io.neta.music.data.native
 
+import io.neta.music.data.AlbumDetail
+import io.neta.music.data.AlbumSummary
+import io.neta.music.data.ArtistAlbumPage
+import io.neta.music.data.ArtistDetail
+import io.neta.music.data.ArtistProfile
 import io.neta.music.data.CollectionResult
 import io.neta.music.data.Playlist
 import io.neta.music.data.PlaylistCategory
@@ -9,6 +14,9 @@ import io.neta.music.data.QRCreateResult
 import io.neta.music.data.QRSession
 import io.neta.music.data.Song
 import io.neta.music.data.TopList
+import io.neta.music.data.normalizePublishTime
+import io.neta.music.data.toAlbumSummary
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -67,6 +75,8 @@ private val KUGOU_INFO = ProviderInfo(
 class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
     private val json = NativeHttp.json
     private val volumeCache = ConcurrentHashMap<String, Map<String, String>>()
+    /** 音质探测结果按 cookie 缓存：一次会试完所有档位，进设置页不能每次都重跑。 */
+    private val availableQualityCache = ConcurrentHashMap<String, List<AudioQualityOption>>()
 
     override val supportsSearchPagination: Boolean = true
 
@@ -222,8 +232,9 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
         return fetchSongInfo(cookie, match.groupValues[1])
     }
 
-    override suspend fun downloadUrl(cookie: String, song: Song): String {
+    override suspend fun downloadUrl(cookie: String, song: Song, quality: AudioQuality): String {
         if (song.source != "kugou") throw IllegalArgumentException("source mismatch")
+        if (quality != AudioQuality.Auto) return downloadAtQuality(cookie, song, quality)
         if (song.url.isNotEmpty()) return song.url
 
         val hash = song.extra["hash"].orEmpty().ifEmpty { song.id }
@@ -244,8 +255,121 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
         return fetchSongInfo(cookie, hash).url
     }
 
-    override suspend fun playableStream(cookie: String, song: Song, workDir: File): PlayableStream {
-        val url = song.url.ifBlank { downloadUrl(cookie, song) }
+    /**
+     * 酷狗同一首歌有多个 hash，每个 hash 对应一档音质。按请求档位挑 hash，
+     * 取回的流再按 ext+码率复核：接口给低了就换下一个 hash，绝不返回低档地址。
+     */
+    private suspend fun downloadAtQuality(cookie: String, song: Song, quality: AudioQuality): String {
+        val hashes = kugouHashesForQuality(song, quality)
+        if (hashes.isEmpty()) {
+            throw IllegalStateException("kugou audio quality ${quality.id} is unavailable for this song")
+        }
+        var lastError: Exception? = null
+        for (hash in hashes) {
+            val candidate = song.copy(
+                id = hash,
+                extra = mapOf(
+                    "hash" to hash,
+                    "album_audio_id" to firstNonEmpty(
+                        song.extra["album_audio_id"].orEmpty(),
+                        song.extra["audio_id"].orEmpty(),
+                    ),
+                    "album_id" to firstNonEmpty(song.extra["album_id"].orEmpty(), song.albumId),
+                    "privilege" to song.extra["privilege"].orEmpty(),
+                ),
+            )
+            val info = try {
+                fetchKugouQualityInfo(cookie, candidate, hash)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                lastError = error
+                continue
+            }
+            if (info.url.isBlank()) continue
+            val actual = kugouSongQuality(info)
+            if (actual != quality) {
+                lastError = IllegalStateException("kugou returned ${actual.id} instead of ${quality.id}")
+                continue
+            }
+            return info.url
+        }
+        throw IllegalStateException(
+            "kugou audio quality ${quality.id} unavailable: ${lastError?.message ?: "no playable hash"}",
+            lastError,
+        )
+    }
+
+    /** 依次试 VIP 下载、songinfo v2、tracker 和匿名取流；前一个失败就退下一个。 */
+    private suspend fun fetchKugouQualityInfo(cookie: String, song: Song, hash: String): Song {
+        var lastError: Exception? = null
+        try {
+            val info = fetchVipSongInfo(cookie, song, VipCache())
+            if (info != null && info.url.isNotEmpty()) return info
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            lastError = error
+        }
+        val attempts: List<suspend () -> Song> = listOf(
+            { fetchSonginfoV2(cookie, hash) },
+            { fetchTrackerSongInfo(cookie, hash) },
+            { fetchSongInfo(cookie, hash) },
+        )
+        for (attempt in attempts) {
+            try {
+                val info = attempt()
+                if (info.url.isNotEmpty()) return info
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                lastError = error
+            }
+        }
+        throw lastError ?: IllegalStateException("kugou download url not found")
+    }
+
+    /**
+     * 探测账号实际能取的音质档：逐首试，第一首能唱出任何一档就停——音质是曲目属性，
+     * 拿很多首无关歌曲去补缺档只会更慢。搜索词固定，结果可复现。
+     */
+    override suspend fun availableQualityOptions(cookie: String): List<AudioQualityOption> {
+        val cacheKey = NativeCrypto.md5Hex(cookie)
+        availableQualityCache[cacheKey]?.let { return it }
+        val probeSongs = buildList {
+            val searched = try {
+                searchSongs(cookie, KUGOU_QUALITY_PROBE_KEYWORD)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                emptyList()
+            }
+            addAll(searched.take(3))
+            add(KUGOU_QUALITY_PROBE_SONG)
+        }
+        var result: List<AudioQualityOption> = emptyList()
+        for (song in probeSongs) {
+            val available = KUGOU_QUALITY_LADDER.options.filter { option ->
+                try {
+                    downloadAtQuality(cookie, song, option.value)
+                    true
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    false
+                }
+            }
+            if (available.isNotEmpty()) {
+                result = available
+                break
+            }
+        }
+        availableQualityCache[cacheKey] = result
+        return result
+    }
+
+    override suspend fun playableStream(cookie: String, song: Song, workDir: File, quality: AudioQuality): PlayableStream {
+        // 指定档位时不能用 song.url（那是搜索时的最高档 hash），必须按档位重新取
+        val url = if (quality != AudioQuality.Auto) {
+            downloadUrl(cookie, song, quality)
+        } else {
+            song.url.ifBlank { downloadUrl(cookie, song, AudioQuality.Auto) }
+        }
         val hash = song.extra["hash"].orEmpty().ifEmpty { song.id }
         return PlayableStream(
             url = url,
@@ -344,6 +468,11 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
 
     override suspend fun parsePlaylist(cookie: String, link: String): CollectionResult {
         return when {
+            // 直接输入的歌单 ID（导入入口用）：纯数字是 special id，gcid_ 前缀是歌单
+            isBareKugouPlaylistId(link) -> {
+                val (playlist, songs) = fetchPlaylistDetail(cookie, link.trim())
+                CollectionResult(playlist, songs)
+            }
             link.contains("/yy/special/single/") -> {
                 val match = KUGOU_SPECIAL_LINK_REGEX.find(link)
                     ?: throw IllegalArgumentException("invalid kugou playlist link")
@@ -358,6 +487,13 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
             }
             else -> throw IllegalArgumentException("invalid kugou playlist link")
         }
+    }
+
+    /** 不带链接、直接输入的酷狗歌单 ID：纯数字（special id）或 gcid_ 前缀（歌单）。 */
+    private fun isBareKugouPlaylistId(link: String): Boolean {
+        val trimmed = link.trim()
+        if (trimmed.isEmpty() || trimmed.contains("/")) return false
+        return trimmed.all { it in '0'..'9' } || trimmed.startsWith("gcid_")
     }
 
     override suspend fun playlistWritable(cookie: String, id: String): Boolean? {
@@ -703,6 +839,93 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
             return CollectionResult(playlist, songs)
         }
         throw IllegalArgumentException("invalid kugou album link")
+    }
+
+    /** 歌手资料：singer/info 给头像、歌曲 / 专辑 / MV 数和简介；没有粉丝数和生日这类资料。 */
+    override suspend fun artistDetail(cookie: String, id: String): ArtistDetail {
+        val singerId = id.trim()
+        if (singerId.isEmpty() || !singerId.all { it.isDigit() }) {
+            throw IllegalArgumentException("invalid kugou singer id: $id")
+        }
+        val url = "http://mobilecdn.kugou.com/api/v3/singer/info?" + query(
+            mapOf("singerid" to singerId, "with_res_tag" to "1")
+        )
+        val body = NativeHttp.get(url, cookie = cookie, randomIp = true, userAgent = MOBILE_USER_AGENT)
+        return ArtistDetail(parseSingerProfile(body, singerId))
+    }
+
+    internal fun parseSingerProfile(body: String, singerId: String): ArtistProfile {
+        val resp = json.decodeFromString<KugouSingerInfoResponse>(kugouStripTag(body))
+        if (resp.errcode != 0 || resp.status != 1) {
+            throw IllegalStateException("kugou singer info api error: status=${resp.status} errcode=${resp.errcode}")
+        }
+        val info = resp.data
+        val id = info.singerId.takeIf { it > 0 }?.toString() ?: singerId
+        // profile 是带段落的完整简介，intro 是短的旧简介，mix_intro 是 HTML 版
+        val description = artistPlainText(info.profile)
+            .ifBlank { artistPlainText(info.intro) }
+            .ifBlank { artistPlainText(info.mixIntro) }
+        return ArtistProfile(
+            id = id,
+            name = info.singerName,
+            source = "kugou",
+            avatar = info.imgUrl.replace("{size}", KUGOU_ARTIST_AVATAR_SIZE),
+            alias = info.alias.trim(),
+            description = description,
+            songCount = info.songCount,
+            albumCount = info.albumCount,
+            mvCount = info.mvCount,
+            link = "https://www.kugou.com/singer/$id.html",
+        )
+    }
+
+    /** 歌手专辑：singer/album 默认按发行时间从新到旧，响应外面也包着 KG_TAG_RES 注释。 */
+    override suspend fun artistAlbums(cookie: String, id: String, page: Int, limit: Int): ArtistAlbumPage {
+        val singerId = id.trim()
+        if (singerId.isEmpty() || !singerId.all { it.isDigit() }) {
+            throw IllegalArgumentException("invalid kugou singer id: $id")
+        }
+        val pageNo = page.coerceAtLeast(1)
+        val size = limit.coerceIn(1, 100)
+        val url = "http://mobilecdn.kugou.com/api/v3/singer/album?" + query(
+            mapOf(
+                "singerid" to singerId,
+                "page" to pageNo.toString(),
+                "pagesize" to size.toString(),
+                "with_res_tag" to "1",
+            )
+        )
+        val body = NativeHttp.get(url, cookie = cookie, randomIp = true, userAgent = MOBILE_USER_AGENT)
+        return parseSingerAlbums(body, singerId, pageNo, size)
+    }
+
+    internal fun parseSingerAlbums(body: String, singerId: String, page: Int, limit: Int): ArtistAlbumPage {
+        val resp = json.decodeFromString<KugouSingerAlbumsResponse>(kugouStripTag(body))
+        if (resp.errcode != 0 || resp.status != 1) {
+            throw IllegalStateException("kugou singer albums api error: status=${resp.status} errcode=${resp.errcode} error=${resp.error}")
+        }
+        val items = resp.data.info
+        val albums = items.filter { it.albumId > 0 }.map { item ->
+            AlbumSummary(
+                id = item.albumId.toString(),
+                name = item.albumName.trim(),
+                source = "kugou",
+                cover = item.imgUrl.replaceFirst("{size}", "240"),
+                artist = item.singerName.trim(),
+                artistId = singerId,
+                publishTime = normalizePublishTime(item.publishTime),
+                trackCount = item.songCount,
+                link = "https://www.kugou.com/album/${item.albumId}.html",
+            )
+        }
+        val total = resp.data.total
+        val hasMore = if (total > 0) (page - 1) * limit + items.size < total else items.size >= limit
+        return ArtistAlbumPage(albums = albums, total = total, hasMore = hasMore)
+    }
+
+    override suspend fun albumDetail(cookie: String, id: String): AlbumDetail {
+        val (playlist, songs) = fetchAlbumDetail(cookie, id)
+        return AlbumDetail(playlist.toAlbumSummary(), songs)
     }
 
     override suspend fun categories(cookie: String): List<PlaylistCategory> {
@@ -1054,7 +1277,7 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
         )
     }
 
-    private suspend fun fetchUnionVip(
+    internal suspend fun fetchUnionVip(
         cookie: String,
         token: String,
         userid: String,
@@ -1082,6 +1305,52 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
         )
         val root = json.parseToJsonElement(body).jsonObject
         return root["data"] as? JsonObject
+    }
+
+    /**
+     * 概念版 youth 活动接口的签名 POST：公共参数 + [extra] + signature，请求体为空。
+     * 算法和 [fetchUnionVip]、云盘写入、账号资料同一套（`MD5(salt + 排序参数 + body + salt)`），
+     * 只是路径和业务参数不一样，见 [KugouWelfare]。
+     */
+    internal suspend fun kugouYouthRequest(
+        cookie: String,
+        path: String,
+        extra: Map<String, String> = emptyMap(),
+    ): String {
+        val cookieMap = parseKugouCookie(cookie)
+        val mid = firstNonEmpty(
+            cookieMap["KUGOU_API_MID"].orEmpty(),
+            cookieMap["kg_mid"].orEmpty(),
+            cookieMap["mid"].orEmpty(),
+            "-",
+        )
+        val dfid = firstNonEmpty(
+            cookieMap["dfid"].orEmpty(),
+            cookieMap["KUGOU_API_DFID"].orEmpty(),
+            cookieMap["kg_dfid"].orEmpty(),
+            "-",
+        )
+        val clienttime = nowSeconds()
+        val params = mutableMapOf(
+            "dfid" to dfid,
+            "mid" to mid,
+            "uuid" to "-",
+            "appid" to KUGOU_LITE_APP_ID,
+            "clientver" to KUGOU_LITE_VER,
+            "clienttime" to clienttime,
+            "token" to cookieMap["token"].orEmpty().trim(),
+            "userid" to cookieMap["userid"].orEmpty().trim(),
+        )
+        params.putAll(extra)
+        // 业务参数全在 query 里，body 是空的；签名按空 body 算，和官方客户端一致
+        return NativeHttp.postForm(
+            buildAndroidUrl(KUGOU_GATEWAY + path, params, ""),
+            emptyMap(),
+            headers = androidHeaders(dfid, mid, clienttime),
+            cookie = cookie,
+            randomIp = true,
+            userAgent = KUGOU_ANDROID_UA,
+        ).body
     }
 
     // ---- song info / download ----
@@ -1730,11 +1999,13 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
             description = info.data.intro,
             source = "kugou",
             link = "https://www.kugou.com/album/$id.html",
-            extra = mapOf(
-                "type" to "album",
-                "album_id" to firstNonEmpty(info.data.albumId.toString(), id),
-                "publish_time" to info.data.publishTime,
-            ),
+            extra = buildMap {
+                put("type", "album")
+                put("album_id", firstNonEmpty(info.data.albumId.toString(), id))
+                put("publish_time", info.data.publishTime)
+                // 专辑页的歌手入口、“更多专辑”用
+                if (info.data.singerId > 0) put("artist_id", info.data.singerId.toString())
+            },
         )
         return playlist to songs
     }
@@ -2756,18 +3027,6 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
         return result
     }
 
-    private fun parseKugouCookie(cookie: String): Map<String, String> {
-        val result = mutableMapOf<String, String>()
-        for (pair in cookie.split(';')) {
-            val trimmed = pair.trim()
-            if (trimmed.isEmpty()) continue
-            val index = trimmed.indexOf('=')
-            if (index <= 0) continue
-            result[trimmed.substring(0, index).trim()] = trimmed.substring(index + 1).trim()
-        }
-        return result
-    }
-
     private fun kugouHasAppCookie(cookie: Map<String, String>): Boolean =
         cookie["token"].orEmpty().trim().isNotEmpty() &&
             cookie["userid"].orEmpty().trim().isNotEmpty() &&
@@ -3121,6 +3380,8 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
     private data class KrcLine(val startMs: Int, val endMs: Int, val words: List<KrcWord>)
 
     private companion object {
+        /** 歌手头像档位：softhead 的 240 / 480 / 800 / 1000 都有，800 已经够铺满歌手页头部。 */
+        const val KUGOU_ARTIST_AVATAR_SIZE = "800"
         const val MOBILE_USER_AGENT =
             "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1"
         const val SEARCH_USER_AGENT =
@@ -3175,6 +3436,97 @@ class KugouProvider : BaseNativeProvider(KUGOU_INFO) {
     }
 }
 
+/** 酷狗的可选音质档，从高到低。移植自 music-lib 的 kugou/quality.go。 */
+internal val KUGOU_QUALITY_LADDER: AudioQualityLadder = AudioQualityLadder.of(
+    listOf(
+        AudioQualityOption(AudioQuality.HiRes, "Hi-Res 无损", "flac", vip = true),
+        AudioQualityOption(AudioQuality.Lossless, "无损音质", "flac", vip = true),
+        AudioQualityOption(AudioQuality.High, "高品质 320k", "mp3", 320),
+        AudioQualityOption(AudioQuality.Higher, "较高品质 192k", "ogg", 192),
+        AudioQualityOption(AudioQuality.Standard, "标准音质 128k", "mp3", 128),
+        AudioQualityOption(AudioQuality.Low, "低品质 64k", "mp3", 64),
+    ),
+)
+
+/** 固定探测曲目：hardcode 的各档 hash 齐全，换歌反而可能缺档。 */
+internal val KUGOU_QUALITY_PROBE_SONG: Song = Song(
+    id = "83368470292244265486BF864701222C",
+    albumId = "82564821",
+    source = "kugou",
+    extra = mapOf(
+        "hash" to "83368470292244265486BF864701222C",
+        "ogg_320_hash" to "878D0D6E847F402299D29D4295BC21CB",
+        "ogg_128_hash" to "A76E5E3C04E98737DBDD0C8C550EDAE5",
+        "sq_hash" to "83368470292244265486BF864701222C",
+        "file_hash" to "AB05B8F658851282DCB2CBAD548AEB9B",
+        "res_hash" to "983AA9AF17E1688CC70EDEAAF6256D5B",
+        "hq_hash" to "7DD13522B6C143A39E10507B74B0A876",
+        "album_audio_id" to "590964610",
+        "album_id" to "82564821",
+        "privilege" to "10",
+    ),
+)
+
+private const val KUGOU_QUALITY_PROBE_KEYWORD = "痛仰乐队"
+
+/**
+ * 档位 → 候选 hash。同一首歌不同档对应不同 hash：低档优先 ogg_128，320k 用 ogg_320/hq，
+ * 无损用 sq，Hi-Res 用 res。返回空表表示这首歌没有这一档。
+ */
+internal fun kugouHashesForQuality(song: Song, quality: AudioQuality): List<String> {
+    val keys = when (quality) {
+        AudioQuality.Low, AudioQuality.Standard -> listOf("ogg_128_hash", "file_hash", "hash")
+        AudioQuality.Higher -> listOf("ogg_320_hash", "hq_hash", "res_hash", "hash")
+        AudioQuality.High -> listOf("ogg_320_hash", "hq_hash", "res_hash", "file_hash", "hash")
+        AudioQuality.Lossless -> listOf("sq_hash", "hash")
+        AudioQuality.HiRes -> listOf("res_hash", "sq_hash", "hash")
+        else -> return emptyList()
+    }
+    val seen = HashSet<String>()
+    val result = mutableListOf<String>()
+    for (key in keys) {
+        val hash = song.extra[key].orEmpty().trim().lowercase(Locale.ROOT)
+        if (!kugouValidHash(hash) || !seen.add(hash)) continue
+        result += hash
+    }
+    val id = song.id.trim().lowercase(Locale.ROOT)
+    if (kugouValidHash(id) && seen.add(id)) result += id
+    return result
+}
+
+/**
+ * 取回来的流实际是哪一档：接口给的码率优先，缺码率时按 size/时长反推。
+ * 用于「不静默降档」校验，口径与 Go 侧 kugouSongQuality 一致。
+ */
+internal fun kugouSongQuality(song: Song): AudioQuality {
+    val ext = song.ext.trim().lowercase(Locale.ROOT)
+    val bitrate = kugouInferBitrate(song.bitrate, song.size, song.duration)
+    return when {
+        ext == "flac" && bitrate >= 1000 -> AudioQuality.HiRes
+        kugouLooksLossless(ext, bitrate, song.size) -> AudioQuality.Lossless
+        bitrate >= 280 -> AudioQuality.High
+        bitrate >= 180 -> AudioQuality.Higher
+        bitrate >= 96 -> AudioQuality.Standard
+        else -> AudioQuality.Low
+    }
+}
+
+private fun kugouInferBitrate(bitrate: Int, size: Long, duration: Int): Int {
+    val normalized = if (bitrate > 1000) bitrate / 1000 else bitrate
+    if (normalized > 0) return normalized
+    val seconds = if (duration > 1000) duration / 1000 else duration
+    if (size <= 0 || seconds <= 0) return 0
+    return (size * 8 / seconds / 1000).toInt()
+}
+
+private fun kugouLooksLossless(ext: String, bitrate: Int, size: Long): Boolean {
+    if (ext == "flac" || ext == "ape" || ext == "wav") return true
+    return bitrate >= 700 || size >= 20L * 1024 * 1024
+}
+
+private fun kugouValidHash(hash: String): Boolean =
+    hash.isNotEmpty() && hash != "00000000000000000000000000000000"
+
 /**
  * 酷狗会员产品：user_type 的 16 位是超级VIP，vip_type=6 是豪华VIP，
  * busi_vip 里的 svip/tvip 分别是概念VIP/畅听VIP（签到等活动发的会员）。
@@ -3186,6 +3538,23 @@ internal fun kugouMembershipLabel(vipType: Int, userType: Int, products: Map<Str
     if ((products["tvip"] ?: 0) > 0) return "畅听VIP"
     if (vipType > 0 || products.values.any { it > 0 }) return "VIP"
     return null
+}
+
+/**
+ * 酷狗 Cookie 拆成字段表。概念版的 youth 活动接口和账号资料接口都要从里面取
+ * token / userid / mid / dfid，见 [KugouWelfare]。
+ */
+internal fun parseKugouCookie(cookie: String): Map<String, String> {
+    val result = mutableMapOf<String, String>()
+    for (pair in cookie.split(';')) {
+        val trimmed = pair.trim()
+        if (trimmed.isEmpty()) continue
+        val index = trimmed.indexOf('=')
+        if (index <= 0) continue
+        result[trimmed.substring(0, index).trim()] = trimmed.substring(index + 1).trim()
+    }
+    return result
+
 }
 
 // ---- response DTOs ----
@@ -3412,6 +3781,7 @@ private data class KugouAlbumInfoData(
     @SerialName("publishtime") val publishTime: String = "",
     @SerialName("play_count") val playCount: Int = 0,
     @SerialName("songcount") val songCount: Int = 0,
+    @SerialName("singerid") val singerId: Long = 0,
 )
 
 @Serializable
@@ -3442,6 +3812,35 @@ private data class KugouSingerInfo(
     @SerialName("singername") val singerName: String = "",
     @SerialName("songcount") val songCount: Int = 0,
     @SerialName("albumcount") val albumCount: Int = 0,
+    @SerialName("imgurl") val imgUrl: String = "",
+    @SerialName("mvcount") val mvCount: Int = 0,
+    val alias: String = "",
+    val profile: String = "",
+    val intro: String = "",
+    @SerialName("mix_intro") val mixIntro: String = "",
+)
+
+@Serializable
+private data class KugouSingerAlbumsResponse(
+    val status: Int = 0,
+    val errcode: Int = 0,
+    val error: String = "",
+    val data: KugouSingerAlbumsData = KugouSingerAlbumsData(),
+)
+
+@Serializable
+private data class KugouSingerAlbumsData(
+    val total: Int = 0,
+    val info: List<KugouSingerAlbumItem> = emptyList(),
+)
+
+@Serializable
+private data class KugouSingerAlbumItem(
+    @SerialName("albumid") val albumId: Long = 0,
+    @SerialName("albumname") val albumName: String = "",
+    @SerialName("singername") val singerName: String = "",
+    @SerialName("songcount") val songCount: Int = 0,
+    @SerialName("publishtime") val publishTime: String = "",
     @SerialName("imgurl") val imgUrl: String = "",
 )
 

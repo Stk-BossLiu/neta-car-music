@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Palette
@@ -82,6 +83,7 @@ internal enum class SettingsSection(
     Report("settings/report", "播放上报", "把播放记录回传给平台，推荐跟着口味走", Icons.Filled.Analytics, IconTone.Primary),
     Equalizer("settings/equalizer", "均衡器", "本机播放音效，不影响下载文件", Icons.Filled.GraphicEq, IconTone.Primary),
     Sources("settings/sources", "音乐源", "启用哪些平台、按什么顺序", Icons.Filled.Tune, IconTone.Primary),
+    LxSources("settings/lx-sources", "自定义音源", "落雪脚本：添加、排序与启停", Icons.Filled.Extension, IconTone.Primary),
     Search("settings/search", "搜索与浏览", "默认浏览来源", Icons.Filled.Search, IconTone.Primary),
     Accounts("settings/accounts", "平台账号", "扫码登录、Cookie 与退出", Icons.Filled.Person, IconTone.Secondary),
     Sync("settings/sync", "音乐库同步", "自建歌单的云端同步", Icons.Filled.Cloud, IconTone.Secondary),
@@ -99,7 +101,7 @@ internal enum class SettingsSection(
         /** 设置首页 / 双栏左栏的三组。 */
         val groups = listOf(
             listOf(Appearance, Lyrics, Playback, Report, Equalizer, Sources, Search),
-            listOf(Accounts, Sync, LocalMusic, MusicMcp),
+            listOf(Accounts, Sync, LocalMusic, MusicMcp, LxSources),
             listOf(Storage, About),
         )
     }

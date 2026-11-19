@@ -63,13 +63,36 @@
     margin: 18px 6px 8px; display: flex; justify-content: space-between; align-items: center;
   }
   .section-title .link { font-weight: 500; text-transform: none; letter-spacing: 0; }
-  .hist-item {
-    display: flex; align-items: center; gap: 10px;
-    padding: 12px 14px; background: var(--card); border-radius: 14px; margin-bottom: 8px;
-    cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.05);
+  /* 历史记录：紧凑气泡，长文字省略号截断，不再一行一条 */
+  .hist-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .hist-chip {
+    display: inline-flex; align-items: center; gap: 2px; max-width: min(60vw, 260px);
+    background: var(--chip); border-radius: 99px; padding: 7px 6px 7px 14px; cursor: pointer;
   }
-  .hist-item span { flex: 1; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .hist-item .del { color: var(--sec); padding: 6px; background: transparent; border: none; cursor: pointer; }
+  .hist-chip span {
+    font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+  .hist-chip .del {
+    color: var(--sec); padding: 4px 6px; background: transparent; border: none; cursor: pointer;
+    font-size: 12px; font-family: inherit; flex: none;
+  }
+  /* 历史气泡区与搜索结果之间的分割线 */
+  .divider { height: 1px; background: var(--sep); margin: 16px 6px 12px; }
+  /* 链接 / 歌单 ID 检测条 */
+  .import-bar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    background: var(--card); border-radius: 14px; padding: 10px 12px; margin-bottom: 12px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.05);
+  }
+  .import-bar .txt {
+    flex: 1; min-width: 130px; font-size: 13px; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .import-bar .chip {
+    border: none; background: var(--chip); color: var(--text); border-radius: 99px;
+    padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+  }
+  .import-bar .chip.on { background: var(--accent); color: #fff; }
   .row {
     display: flex; align-items: center; gap: 12px;
     padding: 10px 12px; background: var(--card); border-radius: 14px; margin-bottom: 8px;
@@ -217,9 +240,17 @@ function pushHistory(word) {
 
 /* ---------- 播放状态轮询 ---------- */
 var stateTimer = 0, lastState = null;
+/* 能导入歌单的平台列表（/api/state 带回）和搜索 Tab 注册的导入条渲染器 */
+var providers = [], importBarRenderer = null;
 function pollState() {
   api("/api/state").then(function (s) {
     lastState = s;
+    // 能导入歌单的平台列表（静态小字段）：给裸 ID 的平台选择用
+    if (s.providers && s.providers.length) {
+      var changed = JSON.stringify(s.providers) !== JSON.stringify(providers);
+      providers = s.providers;
+      if (changed && importBarRenderer) importBarRenderer();
+    }
     var bar = document.querySelector(".player .bar i");
     var img = document.querySelector(".player img");
     var ph = document.querySelector(".player .ph");
@@ -310,23 +341,71 @@ function buildSearch(main) {
   var inputWrap = el("div", "search-box");
   inputWrap.innerHTML = TAB_SEARCH_SVG;
   var input = document.createElement("input");
-  input.placeholder = "歌名、歌手，或一句话";
+  input.placeholder = "歌名、歌手，或粘贴歌单链接 / ID";
   input.setAttribute("autocapitalize", "off");
   input.setAttribute("autocomplete", "off");
   input.setAttribute("autocorrect", "off");
   input.setAttribute("spellcheck", "false");
   inputWrap.appendChild(input);
-  var reqBtn = el("button", "btn", "点歌");
-  box.appendChild(inputWrap); box.appendChild(reqBtn);
+  // 搜索和点歌分开两个按钮：搜索出结果挑着播，点歌直接播第一个匹配并插播
+  var searchBtn = el("button", "btn", "搜索");
+  var reqBtn = el("button", "btn secondary", "点歌");
+  box.appendChild(inputWrap); box.appendChild(searchBtn); box.appendChild(reqBtn);
   main.appendChild(box);
-  main.appendChild(el("p", "hint", "搜索后从结果里挑着播；「点歌」直接播第一个匹配并插到当前歌后面。"));
+  main.appendChild(el("p", "hint", "搜索后从结果里挑着播；「点歌」直接播第一个匹配并插到当前歌后面。粘贴歌单链接或输入歌单 ID 可导入歌单。"));
+
+  /* 链接 / 歌单 ID 检测条：粘贴链接直接导入；纯数字 ID 选平台导入 */
+  var importWrap = el("div");
+  main.appendChild(importWrap);
+  var importProvider = "";
+  function runImport(text, provider) {
+    toast("正在导入歌单…");
+    api("/api/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ text: text, provider: provider || "" }),
+    }).then(function (r) {
+      if (r.success) {
+        toast((r.message || "已导入") + (r.count ? " · " + r.count + " 首" : ""));
+        input.value = "";
+      } else toast(r.message || "导入失败，稍后再试");
+      renderImportBar();
+    }).catch(function () { toast("车机服务没有响应"); });
+  }
+  function renderImportBar() {
+    importWrap.textContent = "";
+    var v = input.value.trim();
+    var isLink = /^https?:\/\//i.test(v);
+    // 至少 6 位纯数字才当歌单 ID，避免误伤纯数字歌名
+    var isId = /^\d{6,}$/.test(v);
+    if (!isLink && !isId) return;
+    if (isId && providers.length && !providers.some(function (p) { return p.id === importProvider; })) {
+      importProvider = providers[0].id;
+    }
+    var bar = el("div", "import-bar");
+    bar.appendChild(el("div", "txt", isLink ? "检测到歌单链接，导入后绑定到车机" : "检测到歌单 ID，选平台导入"));
+    if (isId) {
+      providers.forEach(function (p) {
+        var c = el("button", "chip" + (importProvider === p.id ? " on" : ""), p.name);
+        c.onclick = function () { importProvider = p.id; renderImportBar(); };
+        bar.appendChild(c);
+      });
+    }
+    var go = el("button", "btn", "导入歌单");
+    go.onclick = function () { runImport(v, isId ? importProvider : ""); };
+    bar.appendChild(go);
+    importWrap.appendChild(bar);
+  }
+  importBarRenderer = renderImportBar;
 
   var listWrap = el("div");
   main.appendChild(listWrap);
+  var searched = false;
 
   function runSearch(word) {
     word = (word || "").trim();
     if (!word) { toast("先输入搜索词"); return; }
+    searched = true;
     pushHistory(word);
     renderHistory();
     input.blur();
@@ -369,6 +448,7 @@ function buildSearch(main) {
   }
 
   input.addEventListener("keydown", function (e) { if (e.key === "Enter") runSearch(input.value); });
+  searchBtn.onclick = function () { runSearch(input.value); };
 
   function renderHistory() {
     var old = main.querySelector(".hist");
@@ -382,19 +462,24 @@ function buildSearch(main) {
     clear.onclick = function () { saveHistory([]); renderHistory(); };
     title.appendChild(clear);
     wrap.appendChild(title);
+    /* 紧凑气泡：长文字省略号截断，一条记录不再占一整行 */
+    var chips = el("div", "hist-chips");
     list.forEach(function (word) {
-      var item = el("div", "hist-item");
-      item.appendChild(el("span", null, word));
+      var chip = el("div", "hist-chip");
+      chip.appendChild(el("span", null, word));
       var del = el("button", "del"); del.textContent = "✕"; del.setAttribute("aria-label", "删除这条记录");
       del.onclick = function (e) {
         e.stopPropagation();
         saveHistory(loadHistory().filter(function (w) { return w !== word; }));
         renderHistory();
       };
-      item.appendChild(del);
-      item.onclick = function () { input.value = word; runSearch(word); };
-      wrap.appendChild(item);
+      chip.appendChild(del);
+      chip.onclick = function () { input.value = word; renderImportBar(); runSearch(word); };
+      chips.appendChild(chip);
     });
+    wrap.appendChild(chips);
+    // 搜索过之后，历史气泡区和结果区之间放一条分割线
+    if (searched) wrap.appendChild(el("div", "divider"));
     main.insertBefore(wrap, listWrap);
   }
 
@@ -403,6 +488,7 @@ function buildSearch(main) {
   input.addEventListener("input", function () {
     if (input.value) { var old = main.querySelector(".hist"); if (old) old.remove(); }
     else renderHistory();
+    renderImportBar();
   });
   renderHistory();
 

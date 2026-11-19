@@ -81,7 +81,8 @@ private fun SectionContent(
         }
         SettingsSection.Lyrics -> {
             val state by app.model.state.collectAsState()
-            LyricsSettingsScreen(state, actions, onBack, embedded)
+            val lyricon by app.model.lyriconSubscription.collectAsState()
+            LyricsSettingsScreen(state, actions, lyricon, onBack, embedded)
         }
         SettingsSection.Playback -> {
             val state by app.model.state.collectAsState()
@@ -99,6 +100,10 @@ private fun SectionContent(
         SettingsSection.Sources -> {
             val state by app.model.state.collectAsState()
             SourcesSettingsScreen(state, actions, onBack, embedded)
+        }
+        SettingsSection.LxSources -> {
+            val state by app.model.state.collectAsState()
+            LxSourcesSettingsScreen(state, onBack, embedded)
         }
         SettingsSection.Search -> {
             val state by app.model.state.collectAsState()

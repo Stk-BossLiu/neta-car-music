@@ -22,6 +22,8 @@ data class ProviderInfo(
     @SerialName("ParseAlbum") val parseAlbum: Boolean = false,
     @SerialName("UserPlaylists") val userPlaylists: Boolean = false,
     @SerialName("QRLogin") val qrLogin: Boolean = false,
+    /** 支持用户名 + 密码登录（music.op.wiki 的 MHub 账号）。 */
+    @SerialName("PasswordLogin") val passwordLogin: Boolean = false,
     @SerialName("PlaylistCategories") val playlistCategories: Boolean = false,
     @SerialName("TopLists") val topLists: Boolean = false,
     @SerialName("TopListSongs") val topListSongs: Boolean = false,
@@ -31,6 +33,8 @@ data class ProviderInfo(
     @SerialName("PlaylistWrite") val playlistWrite: Boolean = false,
     /** 能把整张歌单的新顺序写回平台；只对自建歌单有效。 */
     @SerialName("PlaylistReorder") val playlistReorder: Boolean = false,
+    /** 这个平台有没有需要用户登录的能力；纯公开 API 的平台（music.op.wiki）为 false。 */
+    @SerialName("LoginRequired") val loginRequired: Boolean = true,
     @SerialName("Unstable") val unstable: String = "",
     @SerialName("Note") val note: String = "",
 )
@@ -125,7 +129,13 @@ data class QRSession(val key: String = "", val url: String = "", @SerialName("im
 data class QRCreateResult(@SerialName("session_id") val sessionId: String = "", val session: QRSession = QRSession())
 
 @Serializable
-data class QRCheckResult(val status: String = "", val message: String = "", val cookie: String = "")
+data class QRCheckResult(
+    val status: String = "",
+    val message: String = "",
+    val cookie: String = "",
+    /** 二维码被平台刷新时带回新图（QQ 的官方登录页会自己换码），界面跟着换。 */
+    @SerialName("image_url") val imageUrl: String = "",
+)
 
 enum class RepeatMode { Off, All, One }
 enum class SearchKind(val label: String) { Song("单曲"), Playlist("歌单"), Album("专辑"), Artist("歌手"), Link("链接") }

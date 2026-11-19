@@ -188,6 +188,7 @@ class SettingsStore(private val context: Context) {
     private val dynamicColorKey = booleanPreferencesKey("dynamic_color")
     private val reduceMotionKey = booleanPreferencesKey("reduce_motion")
     private val volumeNormalizationKey = booleanPreferencesKey("volume_normalization")
+    private val audioQualityKey = stringPreferencesKey("audio_quality")
     private val showBottomNavKey = booleanPreferencesKey("show_bottom_nav")
     private val equalizerEnabledKey = booleanPreferencesKey("equalizer_enabled")
     private val equalizerPresetKey = stringPreferencesKey("equalizer_preset")
@@ -214,6 +215,8 @@ class SettingsStore(private val context: Context) {
     private val cacheLimitKey = intPreferencesKey("cache_limit_mb")
     private val lyricsBackgroundKey = stringPreferencesKey("lyrics_background")
     private val notificationLyricsKey = booleanPreferencesKey("notification_lyrics")
+    private val lyriconProviderEnabledKey = booleanPreferencesKey("lyricon_provider_enabled")
+    private val lyriconSubscriberEnabledKey = booleanPreferencesKey("lyricon_subscriber_enabled")
     /** Apple Music 匿名歌词走第三方中转（zarz / paxsenix / AMLL）的总开关。 */
     private val thirdPartyLyricsKey = booleanPreferencesKey("third_party_lyrics")
     private val rhythmIntensityKey = stringPreferencesKey("rhythm_intensity")
@@ -283,9 +286,12 @@ class SettingsStore(private val context: Context) {
             dynamicColor = values[dynamicColorKey] ?: false,
             reduceMotion = values[reduceMotionKey] ?: false,
             volumeNormalization = values[volumeNormalizationKey] ?: false,
+            audioQuality = values[audioQualityKey] ?: "auto",
             showBottomNav = values[showBottomNavKey] ?: true,
             lyricsBackground = values[lyricsBackgroundKey].toLyricsBackgroundMode(),
             notificationLyrics = values[notificationLyricsKey] ?: false,
+            lyriconProviderEnabled = values[lyriconProviderEnabledKey] ?: true,
+            lyriconSubscriberEnabled = values[lyriconSubscriberEnabledKey] ?: false,
             rhythmIntensity = values[rhythmIntensityKey].toRhythmIntensity(),
             coverShape = values[coverShapeKey].toCoverShapeChoice(),
             tvAmbientClock = values[tvAmbientClockKey] ?: true,
@@ -355,6 +361,7 @@ class SettingsStore(private val context: Context) {
     suspend fun dynamicColor(value: Boolean) = context.dataStore.edit { it[dynamicColorKey] = value }
     suspend fun reduceMotion(value: Boolean) = context.dataStore.edit { it[reduceMotionKey] = value }
     suspend fun volumeNormalization(value: Boolean) = context.dataStore.edit { it[volumeNormalizationKey] = value }
+    suspend fun audioQuality(value: String) = context.dataStore.edit { it[audioQualityKey] = value }
     suspend fun showBottomNav(value: Boolean) = context.dataStore.edit { it[showBottomNavKey] = value }
     suspend fun colorSource(value: String) = context.dataStore.edit { it[colorSourceKey] = value }
     suspend fun customSeed(value: Int) = context.dataStore.edit { it[customSeedKey] = value }
@@ -369,6 +376,8 @@ class SettingsStore(private val context: Context) {
     suspend fun lyricsAlignment(value: String) = context.dataStore.edit { it[lyricsAlignmentKey] = value }
     suspend fun lyricsBackground(value: LyricsBackgroundMode) = context.dataStore.edit { it[lyricsBackgroundKey] = value.name }
     suspend fun notificationLyrics(value: Boolean) = context.dataStore.edit { it[notificationLyricsKey] = value }
+    suspend fun lyriconProviderEnabled(value: Boolean) = context.dataStore.edit { it[lyriconProviderEnabledKey] = value }
+    suspend fun lyriconSubscriberEnabled(value: Boolean) = context.dataStore.edit { it[lyriconSubscriberEnabledKey] = value }
     suspend fun rhythmIntensity(value: RhythmIntensity) = context.dataStore.edit { it[rhythmIntensityKey] = value.name }
     suspend fun coverShape(value: CoverShapeChoice) = context.dataStore.edit { it[coverShapeKey] = value.name }
     suspend fun tvAmbientClock(value: Boolean) = context.dataStore.edit { it[tvAmbientClockKey] = value }
@@ -638,10 +647,15 @@ data class AppSettings(
     val dynamicColor: Boolean = false,
     val reduceMotion: Boolean = false,
     val volumeNormalization: Boolean = false,
+    /** 播放音质偏好：`auto` 或某个 `AudioQuality.id`。平台不支持所选档位时按 auto 处理。 */
+    val audioQuality: String = "auto",
     val showBottomNav: Boolean = true,
     val lyricsBackground: LyricsBackgroundMode = LyricsBackgroundMode.Ambient,
     /** 系统媒体播放条第二行显示当前歌词（顶掉歌手名）；默认关。 */
     val notificationLyrics: Boolean = false,
+    /** 词幕 Provider 默认开；Subscriber 只在用户主动打开后连接。两项都只存在本机。 */
+    val lyriconProviderEnabled: Boolean = true,
+    val lyriconSubscriberEnabled: Boolean = false,
     val rhythmIntensity: RhythmIntensity = RhythmIntensity.Standard,
     val coverShape: CoverShapeChoice = CoverShapeChoice.Random,
     /** 电视环境模式右上角是否显示时钟。 */

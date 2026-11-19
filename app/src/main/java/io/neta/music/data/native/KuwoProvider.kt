@@ -1,11 +1,18 @@
 package io.neta.music.data.native
 
+import io.neta.music.data.AlbumDetail
+import io.neta.music.data.AlbumSummary
+import io.neta.music.data.ArtistAlbumPage
+import io.neta.music.data.ArtistDetail
+import io.neta.music.data.ArtistProfile
 import io.neta.music.data.CollectionResult
 import io.neta.music.data.Playlist
 import io.neta.music.data.PlaylistCategory
 import io.neta.music.data.ProviderInfo
 import io.neta.music.data.Song
 import io.neta.music.data.TopList
+import io.neta.music.data.normalizePublishTime
+import io.neta.music.data.toAlbumSummary
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -17,6 +24,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.ByteArrayInputStream
+import java.io.File
 import java.net.URLEncoder
 import java.nio.charset.Charset
 import java.util.Base64
@@ -49,6 +57,8 @@ private val KUWO_INFO = ProviderInfo(
 class KuwoProvider : BaseNativeProvider(KUWO_INFO) {
     private val json = NativeHttp.json
     private val artistNameCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** 音质探测结果按 cookie 缓存：四档要各打一次取流接口，不能每次进设置页都重跑。 */
+    private val availableQualityCache = java.util.concurrent.ConcurrentHashMap<String, List<AudioQualityOption>>()
 
     override val supportsSearchPagination: Boolean = true
 
@@ -109,11 +119,58 @@ class KuwoProvider : BaseNativeProvider(KUWO_INFO) {
         return fetchFullSongInfo(cookie, match.groupValues[1])
     }
 
-    override suspend fun downloadUrl(cookie: String, song: Song): String {
+    override suspend fun downloadUrl(cookie: String, song: Song, quality: AudioQuality): String {
         if (song.source != "kuwo") throw IllegalArgumentException("source mismatch")
-        if (song.url.isNotEmpty()) return song.url
         val rid = song.extra["rid"]?.takeIf { it.isNotEmpty() } ?: song.id
+        if (quality != AudioQuality.Auto) return downloadAtQuality(cookie, rid, quality)
+        if (song.url.isNotEmpty()) return song.url
         return fetchAudioUrl(cookie, rid)
+    }
+
+    override suspend fun playableStream(cookie: String, song: Song, workDir: File, quality: AudioQuality): PlayableStream {
+        // 指定档位时不能用 song.url：解析歌曲时抓到的那条可能是自动选档的最高档
+        val url = if (quality != AudioQuality.Auto) {
+            downloadUrl(cookie, song, quality)
+        } else {
+            song.url.ifBlank { downloadUrl(cookie, song, AudioQuality.Auto) }
+        }
+        return PlayableStream(url = url, ext = extensionFromUrl(url).ifBlank { song.ext }, bitrate = song.bitrate)
+    }
+
+    /** 按档位取流：接口回的码率/格式低于请求档位就报错，不返回降档地址。 */
+    private suspend fun downloadAtQuality(cookie: String, rid: String, quality: AudioQuality): String {
+        val candidate = KUWO_QUALITY_CANDIDATES.firstOrNull { it.option.value == quality }
+            ?: throw IllegalStateException("unsupported kuwo audio quality: ${quality.id}")
+        if (rid.trim().isEmpty()) throw IllegalStateException("kuwo rid is empty")
+        val info = fetchKuwoAudioInfo(cookie, rid, candidate.br)
+            ?: throw IllegalStateException("kuwo audio quality ${quality.id} unavailable")
+        val actual = kuwoAudioQuality(info.bitrate, info.format)
+        if (actual != quality) {
+            throw IllegalStateException("kuwo returned ${actual.id} instead of ${quality.id}")
+        }
+        return info.url
+    }
+
+    /**
+     * 探测账号实际能选的档位：用固定曲目逐档取流，能取到才保留。
+     * 酷我的 VIP 档不是账号属性而是单曲版权，逐档探比只看会员标记准。
+     */
+    override suspend fun availableQualityOptions(cookie: String): List<AudioQualityOption> {
+        val cacheKey = NativeCrypto.md5Hex(cookie)
+        availableQualityCache[cacheKey]?.let { return it }
+        val options = KUWO_QUALITY_CANDIDATES
+            .filter { candidate ->
+                try {
+                    downloadAtQuality(cookie, KUWO_QUALITY_PROBE_RID, candidate.option.value)
+                    true
+                } catch (error: Exception) {
+                    if (error is kotlinx.coroutines.CancellationException) throw error
+                    false
+                }
+            }
+            .map { it.option }
+        availableQualityCache[cacheKey] = options
+        return options
     }
 
     /**
@@ -227,9 +284,11 @@ class KuwoProvider : BaseNativeProvider(KUWO_INFO) {
         fetchPlaylistDetail(cookie, id).second
 
     override suspend fun parsePlaylist(cookie: String, link: String): CollectionResult {
-        val match = Regex("playlist_detail/(\\d+)").find(link)
+        // 链接里的 playlist_detail/<id>，或直接输入的纯数字歌单 ID（导入入口用）
+        val playlistId = Regex("playlist_detail/(\\d+)").find(link)?.groupValues?.getOrNull(1)
+            ?: link.trim().takeIf { it.isNotEmpty() && it.all { c -> c in '0'..'9' } }
             ?: throw IllegalArgumentException("invalid kuwo playlist link")
-        val (playlist, songs) = fetchPlaylistDetail(cookie, match.groupValues[1])
+        val (playlist, songs) = fetchPlaylistDetail(cookie, playlistId)
         return CollectionResult(playlist, songs)
     }
 
@@ -371,6 +430,141 @@ class KuwoProvider : BaseNativeProvider(KUWO_INFO) {
             return CollectionResult(playlist, songs)
         }
         throw IllegalArgumentException("invalid kuwo album link")
+    }
+
+    /** 歌手资料：r.s?stype=artistinfo（单引号 JSON），生日、星座、身高这些是独立字段。没有粉丝数。 */
+    override suspend fun artistDetail(cookie: String, id: String): ArtistDetail {
+        val artistId = id.trim()
+        if (artistId.isEmpty() || !artistId.all { it.isDigit() }) {
+            throw IllegalArgumentException("invalid kuwo artist id: $id")
+        }
+        val url = "$SEARCH_LEGACY_API?" + query(
+            "stype" to "artistinfo",
+            "artistid" to artistId,
+            "encoding" to "utf8",
+        )
+        val body = NativeHttp.get(url, cookie = cookie, randomIp = true, userAgent = KUWO_USER_AGENT)
+        return ArtistDetail(parseArtistInfo(body, artistId))
+    }
+
+    internal fun parseArtistInfo(body: String, artistId: String): ArtistProfile {
+        val info = try {
+            json.decodeFromString<KuwoArtistInfo>(legacyJson(body))
+        } catch (e: Exception) {
+            throw IllegalStateException("kuwo artist info json parse error: ${e.message}", e)
+        }
+        val name = normalizeKuwoText(info.name)
+        if (name.isEmpty()) throw IllegalStateException("kuwo artist not found")
+        val id = info.id.trim().ifEmpty { artistId }
+        val alias = listOf(info.aartist, info.oname)
+            .map { normalizeKuwoText(it) }
+            .filter { it.isNotEmpty() && it != name }
+            .distinct()
+            .joinToString(" / ")
+        // info / desc 是同一段：前面是简介，“基本资料”之后是外文名、从艺历程这些长段落，简介只取前面
+        val text = normalizeKuwoText(info.info.ifBlank { info.desc })
+        val intro = text.substringBefore("\n基本资料").trim().ifEmpty { text }
+        val facts = listOf(
+            "性别" to info.gender,
+            "生日" to info.birthday,
+            "星座" to info.constellation,
+            "出生地" to info.birthplace,
+            "国家/地区" to info.country,
+            "语种" to info.language.split(';', '；').map { it.trim() }.filter { it.isNotEmpty() }.joinToString("、"),
+            "身高" to info.tall,
+            "体重" to info.weight,
+        ).mapNotNull { (key, value) ->
+            normalizeKuwoText(value).takeIf { it.isNotEmpty() }?.let { key to it }
+        }
+        return ArtistProfile(
+            id = id,
+            name = name,
+            source = "kuwo",
+            avatar = kuwoArtistAvatar(info.htsPic, info.pic),
+            alias = alias,
+            description = artistPlainText(intro),
+            songCount = info.musicnum.trim().toIntOrNull() ?: 0,
+            albumCount = info.albumnum.trim().toIntOrNull() ?: 0,
+            mvCount = info.mvnum.trim().toIntOrNull() ?: 0,
+            facts = facts,
+            link = "http://www.kuwo.cn/singer_detail/$id",
+        )
+    }
+
+    /**
+     * 歌手头像换成最大档：starheads 的 120–1000 各档都能出（2026-11-17 抽查五位歌手都有 1000），
+     * hts_pic 是带域名的 240 档，pic 是 `120/s4s56/58/xxx.jpg` 这样的相对路径。
+     */
+    private fun kuwoArtistAvatar(htsPic: String, pic: String): String {
+        val full = normalizeKuwoText(htsPic)
+        if (full.startsWith("http") && KUWO_STARHEAD_SIZE.containsMatchIn(full)) {
+            return KUWO_STARHEAD_SIZE.replace(full, "/starheads/$KUWO_ARTIST_AVATAR_SIZE/")
+        }
+        val path = normalizeKuwoText(pic).trimStart('/')
+        if (path.isEmpty()) return full
+        if (path.startsWith("http")) return KUWO_STARHEAD_SIZE.replace(path, "/starheads/$KUWO_ARTIST_AVATAR_SIZE/")
+        // 相对路径第一段是尺寸
+        return "https://img1.kuwo.cn/star/starheads/$KUWO_ARTIST_AVATAR_SIZE/" + path.substringAfter('/')
+    }
+
+    /** 歌手专辑：sortby=1 按发行时间从新到旧，pn 从 0 开始；同样是单引号 JSON。 */
+    override suspend fun artistAlbums(cookie: String, id: String, page: Int, limit: Int): ArtistAlbumPage {
+        val artistId = id.trim()
+        if (artistId.isEmpty() || !artistId.all { it.isDigit() }) {
+            throw IllegalArgumentException("invalid kuwo artist id: $id")
+        }
+        val pageNo = page.coerceAtLeast(1)
+        val size = limit.coerceIn(1, 100)
+        val url = "$SEARCH_LEGACY_API?" + query(
+            "stype" to "albumlist",
+            "artistid" to artistId,
+            "sortby" to "1",
+            "rn" to size.toString(),
+            "pn" to (pageNo - 1).toString(),
+            "encoding" to "utf8",
+            "show_copyright_off" to "1",
+            "alflac" to "1",
+            "vipver" to "1",
+        )
+        val body = NativeHttp.get(url, cookie = cookie, randomIp = true, userAgent = KUWO_USER_AGENT)
+        return parseArtistAlbums(body, artistId, pageNo, size)
+    }
+
+    internal fun parseArtistAlbums(body: String, artistId: String, page: Int, limit: Int): ArtistAlbumPage {
+        val response = try {
+            json.decodeFromString<KuwoArtistAlbumsResponse>(legacyJson(body))
+        } catch (e: Exception) {
+            throw IllegalStateException("kuwo artist albums json parse error: ${e.message}", e)
+        }
+        val items = response.albumlist
+        val albums = items.mapNotNull { item ->
+            val albumId = firstNonEmpty(item.albumid, item.id)
+            if (albumId.isEmpty()) return@mapNotNull null
+            AlbumSummary(
+                id = albumId,
+                name = normalizeKuwoText(item.name),
+                source = "kuwo",
+                cover = normalizeKuwoImageUrl(firstNonEmpty(item.htsImg, item.img)),
+                artist = normalizeKuwoText(item.artist),
+                artistId = artistId,
+                publishTime = normalizePublishTime(item.pub),
+                type = normalizeKuwoText(item.startype),
+                trackCount = item.musiccnt.trim().toIntOrNull() ?: 0,
+                company = normalizeKuwoText(item.company),
+                link = "http://www.kuwo.cn/album_detail/$albumId",
+            )
+        }
+        val total = response.total.trim().toIntOrNull() ?: 0
+        val hasMore = if (total > 0) (page - 1) * limit + items.size < total else items.size >= limit
+        return ArtistAlbumPage(albums = albums, total = total, hasMore = hasMore)
+    }
+
+    override suspend fun albumDetail(cookie: String, id: String): AlbumDetail {
+        val (playlist, songs) = fetchAlbumDetail(cookie, id)
+        val summary = playlist.toAlbumSummary()
+        // Playlist.creator 优先放外文名（Jay Chou），专辑页头部和歌手页一致用中文名
+        val artist = playlist.extra["artist_name"].orEmpty().ifBlank { summary.artist }
+        return AlbumDetail(summary.copy(artist = artist), songs)
     }
 
     override suspend fun categories(cookie: String): List<PlaylistCategory> {
@@ -768,7 +962,13 @@ class KuwoProvider : BaseNativeProvider(KUWO_INFO) {
                         "company" to normalizeKuwoText(response["company"].kuwoString()),
                         "publish_time" to response["pub"].kuwoString().trim(),
                         "lang" to normalizeKuwoText(response["lang"].kuwoString()),
-                    ),
+                    ) + buildMap {
+                        // 专辑页的歌手入口、“更多专辑”用
+                        val artistId = response["artistid"].kuwoString()
+                        if (artistId.isNotEmpty() && artistId != "0") put("artist_id", artistId)
+                        val artistName = normalizeKuwoText(response["artist"].kuwoString())
+                        if (artistName.isNotEmpty()) put("artist_name", artistName)
+                    },
                 )
             }
 
@@ -964,6 +1164,27 @@ class KuwoProvider : BaseNativeProvider(KUWO_INFO) {
             link = "http://www.kuwo.cn/play_detail/$rid",
             extra = mapOf("rid" to rid),
         )
+    }
+
+    /** 按 br 单档取流；接口不给 data.url 视为这一档不可用，返回 null。 */
+    private suspend fun fetchKuwoAudioInfo(cookie: String, rid: String, br: String): KuwoAudioInfo? {
+        val randomId = "C_APK_guanwang_${System.currentTimeMillis() * 1_000_000L + Random.nextLong(1_000_000L)}"
+        val url = "$MOBI_API?" + query(
+            "f" to "web",
+            "source" to "kwplayercar_ar_6.0.0.9_B_jiakong_vh.apk",
+            "from" to "PC",
+            "type" to "convert_url_with_sign",
+            "br" to br,
+            "rid" to rid,
+            "user" to randomId,
+        )
+        val body = runCatching {
+            NativeHttp.get(url, cookie = cookie, randomIp = true, userAgent = KUWO_USER_AGENT)
+        }.getOrNull() ?: return null
+        val data = runCatching { json.decodeFromString<KuwoMobiResponse>(body).data }.getOrNull()
+            ?: return null
+        if (data.url.isBlank()) return null
+        return KuwoAudioInfo(data.url, data.bitrate, data.format)
     }
 
     private suspend fun fetchAudioUrl(cookie: String, rid: String): String {
@@ -1903,6 +2124,8 @@ class KuwoProvider : BaseNativeProvider(KUWO_INFO) {
 
     private data class KuwoFormatInfo(val format: String, val bitrate: String, val size: Long)
 
+    private data class KuwoAudioInfo(val url: String, val bitrate: Int, val format: String)
+
     private data class KuwoBangMenuItem(
         val id: String,
         val name: String,
@@ -1938,6 +2161,8 @@ class KuwoProvider : BaseNativeProvider(KUWO_INFO) {
         const val ALBUM_DETAIL_PAGE_SIZE = 100
         const val DEFAULT_HOT_SONG_LIMIT = 100
         const val MAX_HOT_SONG_LIMIT = 200
+        const val KUWO_ARTIST_AVATAR_SIZE = 1000
+        val KUWO_STARHEAD_SIZE = Regex("/starheads/\\d+/")
 
         val KUWO_NEW_LYRIC_LINE = Regex("^\\[(\\d{2}):(\\d{2})\\.(\\d{3})\\](.*)\$")
         val KUWO_NEW_LYRIC_TAG = Regex("^\\[[A-Za-z]+:[^\\]]*\\]\$")
@@ -1975,6 +2200,37 @@ class KuwoProvider : BaseNativeProvider(KUWO_INFO) {
             "apos" to "'",
             "nbsp" to " ",
         )
+    }
+}
+
+/** 一个音质档与它的取流接口参数：br 是 mobi 接口的取值（如 "flac"），不是码率。 */
+internal data class KuwoQualityCandidate(val option: AudioQualityOption, val br: String)
+
+internal val KUWO_QUALITY_CANDIDATES: List<KuwoQualityCandidate> = listOf(
+    KuwoQualityCandidate(AudioQualityOption(AudioQuality.HiRes, "Hi-Res 无损", "flac"), "2000kflac"),
+    KuwoQualityCandidate(AudioQualityOption(AudioQuality.Lossless, "无损音质", "flac", vip = true), "flac"),
+    KuwoQualityCandidate(AudioQualityOption(AudioQuality.High, "高品质 320k", "mp3", 320), "320kmp3"),
+    KuwoQualityCandidate(AudioQualityOption(AudioQuality.Standard, "标准音质 128k", "mp3", 128), "128kmp3"),
+)
+
+/** 酷我的可选音质档，从高到低。 */
+internal val KUWO_QUALITY_LADDER: AudioQualityLadder =
+    AudioQualityLadder.of(KUWO_QUALITY_CANDIDATES.map { it.option })
+
+/** 探测用的固定曲目：曲库常青，四档都有。 */
+private const val KUWO_QUALITY_PROBE_RID = "624683929"
+
+/** 取回来的流实际是哪一档；接口不给码率时按格式判断，和 Go 侧 kuwoAudioQuality 一致。 */
+internal fun kuwoAudioQuality(bitrate: Int, format: String): AudioQuality {
+    val normalizedFormat = format.trim().lowercase(Locale.ROOT)
+    val kbps = if (bitrate > 100_000) bitrate / 1000 else bitrate
+    return when {
+        normalizedFormat.contains("flac") && kbps >= 1000 -> AudioQuality.HiRes
+        normalizedFormat.contains("flac") -> AudioQuality.Lossless
+        kbps >= 280 -> AudioQuality.High
+        kbps >= 180 -> AudioQuality.Higher
+        kbps >= 96 -> AudioQuality.Standard
+        else -> AudioQuality.Low
     }
 }
 
@@ -2023,6 +2279,50 @@ private data class KuwoArtistSearchItem(
     val desc: String = "",
 )
 
+@Serializable
+private data class KuwoArtistInfo(
+    val id: String = "",
+    val name: String = "",
+    val aartist: String = "",
+    val oname: String = "",
+    val pic: String = "",
+    @SerialName("hts_pic") val htsPic: String = "",
+    val info: String = "",
+    val desc: String = "",
+    val gender: String = "",
+    val birthday: String = "",
+    val constellation: String = "",
+    val birthplace: String = "",
+    val country: String = "",
+    val language: String = "",
+    val tall: String = "",
+    val weight: String = "",
+    val musicnum: String = "",
+    val albumnum: String = "",
+    val mvnum: String = "",
+)
+
+@Serializable
+private data class KuwoArtistAlbumsResponse(
+    val albumlist: List<KuwoArtistAlbumItem> = emptyList(),
+    val total: String = "",
+)
+
+@Serializable
+private data class KuwoArtistAlbumItem(
+    val albumid: String = "",
+    val id: String = "",
+    val name: String = "",
+    val artist: String = "",
+    @SerialName("hts_img") val htsImg: String = "",
+    val img: String = "",
+    val pub: String = "",
+    val startype: String = "",
+    val musiccnt: String = "",
+    val company: String = "",
+)
+
+@Serializable
 private data class KuwoAlbumSearchResponse(val albumlist: List<KuwoAlbumSearchItem>? = null)
 
 @Serializable

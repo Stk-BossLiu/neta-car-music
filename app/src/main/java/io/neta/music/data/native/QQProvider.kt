@@ -1,7 +1,10 @@
 package io.neta.music.data.native
 
-import android.util.Log
-import io.neta.music.AppLog
+import io.neta.music.data.AlbumDetail
+import io.neta.music.data.AlbumSummary
+import io.neta.music.data.ArtistAlbumPage
+import io.neta.music.data.ArtistDetail
+import io.neta.music.data.ArtistProfile
 import io.neta.music.data.CollectionResult
 import io.neta.music.data.ListeningMode
 import io.neta.music.data.Playlist
@@ -12,6 +15,8 @@ import io.neta.music.data.QRCreateResult
 import io.neta.music.data.QRSession
 import io.neta.music.data.Song
 import io.neta.music.data.TopList
+import io.neta.music.data.normalizePublishTime
+import io.neta.music.data.toAlbumSummary
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -28,10 +33,6 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
-import okhttp3.Cookie
-import okhttp3.CookieJar
-import okhttp3.HttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.URI
@@ -74,6 +75,8 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
     private val vipCache = ConcurrentHashMap<String, Boolean>()
     private val loginSessions = ConcurrentHashMap<String, QQLoginState>()
     private val volumeCache = ConcurrentHashMap<String, CachedVolume>()
+    /** 音质探测结果按 cookie 缓存：一次要打七八个档位的取流接口，不能每次进设置页都重跑。 */
+    private val availableQualityCache = ConcurrentHashMap<String, List<AudioQualityOption>>()
     /** dissid → (dirid, tid)；写歌单用，只在本进程内缓存。 */
     private val dirIdCache = ConcurrentHashMap<String, Pair<Int, Int>>()
 
@@ -119,7 +122,7 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
                 val songId = uriQueryValue(uri, "songid")
                 if (songId.isNotEmpty()) {
                     val song = fetchSongDetailByID(cookie, songId)
-                    val url = runCatching { downloadUrl(cookie, song) }.getOrNull().orEmpty()
+                    val url = runCatching { downloadUrl(cookie, song, AudioQuality.Auto) }.getOrNull().orEmpty()
                     return if (url.isNotBlank()) song.copy(url = url) else song
                 }
                 val mid = uriQueryValue(uri, "songmid")
@@ -128,26 +131,47 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
         }
         if (songMid.isBlank()) throw IllegalArgumentException("invalid qq music link")
         val song = fetchSongDetail(cookie, songMid)
-        val url = runCatching { downloadUrl(cookie, song) }.getOrNull().orEmpty()
+        val url = runCatching { downloadUrl(cookie, song, AudioQuality.Auto) }.getOrNull().orEmpty()
         return if (url.isNotBlank()) song.copy(url = url) else song
     }
 
-    override suspend fun downloadUrl(cookie: String, song: Song): String {
+    override suspend fun downloadUrl(cookie: String, song: Song, quality: AudioQuality): String {
         if (song.source != "qq") throw IllegalArgumentException("source mismatch")
         val songMid = song.extra["songmid"]?.takeIf { it.isNotBlank() } ?: song.id
-        val isVip = isVipAccount(cookie)
-        val prefixes: List<String>
-        val extensions: List<String>
-        if (isVip) {
-            prefixes = listOf("AI00", "Q001", "Q000", "F000", "O801", "M800", "M500")
-            extensions = listOf("flac", "flac", "flac", "flac", "ogg", "mp3", "mp3")
-        } else {
-            prefixes = listOf("M800", "M500")
-            extensions = listOf("mp3", "mp3")
+        if (songMid.isBlank()) throw IllegalStateException("qq song id is empty")
+
+        // 指定了档位就只请求那一档：purl 为空就是这首歌/这个账号拿不到，不退回低档
+        if (quality != AudioQuality.Auto) {
+            val candidate = qqQualityCandidateFor(quality)
+                ?: throw IllegalStateException("unsupported qq audio quality: ${quality.id}")
+            val purls = requestQualityURLs(cookie, songMid, listOf(candidate))
+            val purl = purls[qqQualityFilename(songMid, candidate)].orEmpty()
+            if (purl.isEmpty()) {
+                throw IllegalStateException("qq audio quality ${quality.id} is unavailable for this song or account")
+            }
+            return "https://ws.stream.qqmusic.qq.com/$purl"
         }
-        val filenames = prefixes.mapIndexed { index, prefix ->
-            "$prefix$songMid$songMid.${extensions[index]}"
+
+        // 自动档照旧从最高档往下取第一个有 purl 的；没有权限的档位接口只是不给 purl
+        val purls = runCatching { requestQualityURLs(cookie, songMid, QQ_QUALITY_CANDIDATES) }
+            .getOrDefault(emptyMap())
+        for (candidate in QQ_QUALITY_CANDIDATES) {
+            val purl = purls[qqQualityFilename(songMid, candidate)].orEmpty()
+            if (purl.isNotEmpty()) return "https://ws.stream.qqmusic.qq.com/$purl"
         }
+        throw IllegalStateException("no valid download url found or vip required")
+    }
+
+    /**
+     * 一次请求多个 filename 拿 purl。会员的档位（母带、全景声、无损）都在这里，
+     * 接口对没有权限的 filename 只是不给 purl，不会报错。
+     */
+    private suspend fun requestQualityURLs(
+        cookie: String,
+        songMid: String,
+        candidates: List<QQQualityCandidate>,
+    ): Map<String, String> {
+        val filenames = candidates.map { qqQualityFilename(songMid, it) }
         val body = buildJsonObject {
             putJsonObject("comm") {
                 put("cv", 4747474)
@@ -183,18 +207,47 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
             userAgent = QQ_USER_AGENT,
         )
         val parsed = json.decodeFromString<QQVkeyResponse>(response.body)
-        for (expected in filenames) {
-            for (info in parsed.req1.data.midUrlInfo) {
-                if (info.filename == expected && info.purl.isNotEmpty()) {
-                    return "https://ws.stream.qqmusic.qq.com/" + info.purl
-                }
-            }
+        if (parsed.req1.code != 0) {
+            throw IllegalStateException("qq geturl api error code: ${parsed.req1.code}")
         }
-        throw IllegalStateException("no valid download url found or vip required")
+        return parsed.req1.data.midUrlInfo
+            .filter { it.filename.isNotEmpty() && it.purl.isNotEmpty() }
+            .associate { it.filename to it.purl }
     }
 
-    override suspend fun playableStream(cookie: String, song: Song, workDir: File): PlayableStream {
-        val url = song.url.ifBlank { downloadUrl(cookie, song) }
+    /**
+     * 探测当前账号实际能取的音质档。用一首固定的热门曲目一次问齐所有 filename，
+     * 有 purl 的才算可用。匿名时接口回 code 1000，此时缓存空表——搜索还能用，但没有可播档位。
+     */
+    override suspend fun availableQualityOptions(cookie: String): List<AudioQualityOption> {
+        val cacheKey = NativeCrypto.md5Hex(cookie)
+        availableQualityCache[cacheKey]?.let { return it }
+        val purls = try {
+            requestQualityURLs(cookie, QQ_QUALITY_PROBE_SONG_MID, QQ_QUALITY_CANDIDATES)
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            if (cookie.isBlank()) {
+                vipCache[cacheKey] = false
+                availableQualityCache[cacheKey] = emptyList()
+                return emptyList()
+            }
+            throw error
+        }
+        val options = QQ_QUALITY_CANDIDATES
+            .filter { purls[qqQualityFilename(QQ_QUALITY_PROBE_SONG_MID, it)].orEmpty().isNotEmpty() }
+            .map { it.quality }
+        availableQualityCache[cacheKey] = options
+        vipCache[cacheKey] = options.any { it.vip }
+        return options
+    }
+
+    override suspend fun playableStream(cookie: String, song: Song, workDir: File, quality: AudioQuality): PlayableStream {
+        // 指定档位时不能用 song.url：那是自动选档时抓到的地址，可能是低档
+        val url = if (quality != AudioQuality.Auto) {
+            downloadUrl(cookie, song, quality)
+        } else {
+            song.url.ifBlank { downloadUrl(cookie, song, AudioQuality.Auto) }
+        }
         val songMid = song.extra["songmid"]?.takeIf { it.isNotBlank() } ?: song.id
         val extra = if (songMid.isBlank()) {
             emptyMap()
@@ -791,6 +844,178 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
         throw IllegalArgumentException("invalid qq album link")
     }
 
+    /**
+     * 歌手资料：GetSingerDetail（基本资料 + 百科）、歌曲总数、专辑总数、粉丝数放在同一个 musicu 请求里。
+     * MV 数没取：GetSingerMvList 的 total 是全部相关视频（周杰伦一万多条），不是 MV 数。
+     */
+    override suspend fun artistDetail(cookie: String, id: String): ArtistDetail {
+        val singerMid = id.trim()
+        if (singerMid.isEmpty()) throw IllegalArgumentException("singer id is empty")
+        val body = buildJsonObject {
+            putJsonObject("comm") {
+                put("ct", 24)
+                put("cv", 0)
+            }
+            putJsonObject("detail") {
+                put("module", "music.musichallSinger.SingerInfoInter")
+                put("method", "GetSingerDetail")
+                putJsonObject("param") {
+                    putJsonArray("singer_mids") { add(JsonPrimitive(singerMid)) }
+                    put("ex_singer", 1)
+                    put("wiki_singer", 1)
+                    put("group_singer", 0)
+                    put("pic", 1)
+                    put("photos", 0)
+                }
+            }
+            putJsonObject("songs") {
+                put("module", "musichall.song_list_server")
+                put("method", "GetSingerSongList")
+                putJsonObject("param") {
+                    put("singerMid", singerMid)
+                    put("order", 1)
+                    put("begin", 0)
+                    put("num", 1)
+                }
+            }
+            putJsonObject("albums") {
+                put("module", "music.musichallAlbum.AlbumListServer")
+                put("method", "GetAlbumList")
+                putJsonObject("param") {
+                    put("singerMid", singerMid)
+                    put("order", 0)
+                    put("begin", 0)
+                    put("num", 1)
+                    put("songNumTag", 0)
+                    put("singerID", 0)
+                }
+            }
+            putJsonObject("fans") {
+                put("module", "Concern.ConcernSystemServer")
+                put("method", "cgi_qry_concern_num")
+                putJsonObject("param") {
+                    putJsonArray("vec_userinfo") {
+                        add(
+                            buildJsonObject {
+                                put("usertype", 1)
+                                put("userid", singerMid)
+                            },
+                        )
+                    }
+                    put("opertype", 6)
+                    put("encrypt_singerid", 1)
+                }
+            }
+        }
+        val response = NativeHttp.postJson(
+            QQ_MUSICU_API,
+            body.toString(),
+            headers = mapOf(
+                "Referer" to "https://y.qq.com/",
+                "Content-Type" to "application/json",
+            ),
+            cookie = cookie,
+            randomIp = true,
+            userAgent = QQ_WINDOWS_USER_AGENT,
+        )
+        return ArtistDetail(parseSingerDetail(response.body, singerMid))
+    }
+
+    internal fun parseSingerDetail(body: String, singerMid: String): ArtistProfile {
+        val root = json.decodeFromString<QQSingerDetailBatch>(body)
+        if (root.detail.code != 0) throw IllegalStateException("qq singer detail api error code: ${root.detail.code}")
+        val singer = root.detail.data.singerList.firstOrNull() ?: throw IllegalStateException("qq singer not found")
+        val basic = singer.basicInfo
+        val mid = basic.singerMid.ifBlank { singerMid }
+        val wiki = parseQQSingerWiki(singer.wiki)
+        val facts = wiki.facts.ifEmpty {
+            listOfNotNull(singer.exInfo.birthday.trim().takeIf { it.isNotEmpty() }?.let { "生日" to it })
+        }
+        val fans = root.fans.data.mapSingerNum[mid]?.userFansnum
+            ?: root.fans.data.mapSingerNum.values.firstOrNull()?.userFansnum
+            ?: 0L
+        return ArtistProfile(
+            id = mid,
+            name = basic.name,
+            source = "qq",
+            // pmid 带图片版本号（换过头像会变），没有就用 mid
+            avatar = "$QQ_SINGER_AVATAR_PREFIX${basic.singerPmid.ifBlank { mid }}.jpg",
+            alias = singer.exInfo.foreignName.trim(),
+            description = wiki.description.ifBlank { artistPlainText(singer.exInfo.desc) },
+            songCount = root.songs.data.totalNum,
+            albumCount = root.albums.data.total,
+            fans = fans,
+            facts = facts,
+            link = "https://y.qq.com/n/ryqq/singer/$mid",
+        )
+    }
+
+    /** 歌手专辑：order=0 按发行时间从新到旧；songNumTag=1 才会带每张专辑的曲目数。 */
+    override suspend fun artistAlbums(cookie: String, id: String, page: Int, limit: Int): ArtistAlbumPage {
+        val singerMid = id.trim()
+        if (singerMid.isEmpty()) throw IllegalArgumentException("singer id is empty")
+        val size = limit.coerceIn(1, 100)
+        val begin = (page.coerceAtLeast(1) - 1) * size
+        val body = buildJsonObject {
+            putJsonObject("comm") {
+                put("ct", 24)
+                put("cv", 0)
+            }
+            putJsonObject("albums") {
+                put("module", "music.musichallAlbum.AlbumListServer")
+                put("method", "GetAlbumList")
+                putJsonObject("param") {
+                    put("singerMid", singerMid)
+                    put("order", 0)
+                    put("begin", begin)
+                    put("num", size)
+                    put("songNumTag", 1)
+                    put("singerID", 0)
+                }
+            }
+        }
+        val response = NativeHttp.postJson(
+            QQ_MUSICU_API,
+            body.toString(),
+            headers = mapOf(
+                "Referer" to "https://y.qq.com/",
+                "Content-Type" to "application/json",
+            ),
+            cookie = cookie,
+            randomIp = true,
+            userAgent = QQ_WINDOWS_USER_AGENT,
+        )
+        return parseSingerAlbums(response.body, singerMid, begin, size)
+    }
+
+    internal fun parseSingerAlbums(body: String, singerMid: String, begin: Int, limit: Int): ArtistAlbumPage {
+        val root = json.decodeFromString<QQSingerAlbumsResponse>(body)
+        if (root.albums.code != 0) throw IllegalStateException("qq singer albums api error code: ${root.albums.code}")
+        val list = root.albums.data.albumList
+        val albums = list.filter { it.albumMid.isNotBlank() }.map { item ->
+            AlbumSummary(
+                id = item.albumMid,
+                name = item.albumName,
+                source = "qq",
+                cover = coverUrl(item.albumMid),
+                artist = item.singerName,
+                artistId = singerMid,
+                publishTime = normalizePublishTime(item.publishDate),
+                type = item.albumType.trim(),
+                trackCount = item.totalNum,
+                link = "https://y.qq.com/n/ryqq/albumDetail/${item.albumMid}",
+            )
+        }
+        val total = root.albums.data.total
+        val hasMore = if (total > 0) begin + list.size < total else list.size >= limit
+        return ArtistAlbumPage(albums = albums, total = total, hasMore = hasMore)
+    }
+
+    override suspend fun albumDetail(cookie: String, id: String): AlbumDetail {
+        val (playlist, songs) = fetchAlbumDetail(cookie, id)
+        return AlbumDetail(playlist.toAlbumSummary(), songs)
+    }
+
     override suspend fun categories(cookie: String): List<PlaylistCategory> {
         val url = QQ_CATEGORY_API + "?" + qqQuery(
             "format" to "json",
@@ -1216,12 +1441,60 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
     }
 
     override suspend fun checkLogin(sessionId: String, key: String): QRCheckResult {
-        val params = parseQuery(key)
-        val type = params["type"]?.trim().orEmpty()
-            .ifBlank { loginSessions[sessionId]?.type ?: "qq" }
-        val result = if (type == "wx") checkWxLogin(key) else checkQqLogin(sessionId, key)
-        if (result.status == "success" || result.status == "expired") loginSessions.remove(sessionId)
+        val mode = loginSessions[sessionId]?.mode
+            ?: parseQuery(key)["mode"]?.trim().orEmpty().ifBlank {
+                parseQuery(key)["type"]?.trim().orEmpty().ifBlank { QQ_MODE_NATIVE }
+            }
+        val result = when (mode) {
+            QQ_MODE_WX -> checkWxLogin(key)
+            QQ_MODE_WEB -> checkQqWebLogin(sessionId)
+            else -> checkQqLogin(key)
+        }
+        if (result.status != "waiting" && result.status != "scanned") {
+            QQLoginPage.close()
+            loginSessions.remove(sessionId)
+        }
         return result
+    }
+
+    /** 用户关了面板：隐藏 WebView 跟着销毁，别让官方登录页在后台继续轮询。 */
+    override fun cancelLogin(sessionId: String) {
+        if (loginSessions.remove(sessionId)?.mode == QQ_MODE_WEB) QQLoginPage.close()
+    }
+
+    /**
+     * WebView 通道的轮询：页面自己在扫，本层只盯两件事——二维码被刷新了就跟着换图，
+     * 登录态落到 cookie 里了就收走 cookie 交给原生那步授权换 key。
+     */
+    private suspend fun checkQqWebLogin(sessionId: String): QRCheckResult {
+        val state = loginSessions[sessionId] ?: return QRCheckResult("failed", "qq login session missing", "")
+        // Activity 重建过，旧页面已经废了：明说，别让用户干等到超时
+        if (!QQLoginPage.isAlive()) return QRCheckResult("failed", "登录页已关闭，请重试", "")
+        val shown = state.cookies["qr"].orEmpty()
+        val current = QQLoginPage.qrImageUrl()
+        if (current.isNotEmpty() && current != shown) {
+            loginSessions[sessionId] = state.copy(cookies = state.cookies + ("qr" to current))
+            val dataUrl = QQLoginPage.qrImageDataUrl()
+            if (dataUrl.isNotEmpty()) {
+                return QRCheckResult(
+                    status = "waiting",
+                    message = "二维码已刷新，请重新扫描",
+                    cookie = "",
+                    imageUrl = dataUrl,
+                )
+            }
+        }
+        if (!QQLoginPage.hasLoginCookie()) {
+            return QRCheckResult("waiting", "等待扫码", "")
+        }
+        val cookieHeader = QQLoginPage.harvestCookies(QQ_LOGIN_COOKIE_URLS)
+        if (cookieHeader.isBlank()) return QRCheckResult("failed", "qq login cookie missing", "")
+        val cookies = LinkedHashMap<String, String>()
+        cookieHeader.split(";").forEach { part ->
+            val index = part.indexOf('=')
+            if (index > 0) cookies[part.substring(0, index).trim()] = part.substring(index + 1).trim()
+        }
+        return authorizeQQMusicLogin(cookies, "登录成功")
     }
 
     private suspend fun fetchSingerSongs(cookie: String, id: String): List<Song> {
@@ -1422,13 +1695,16 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
             description = info.desc,
             source = "qq",
             link = "https://y.qq.com/n/ryqq/albumDetail/$albumMid",
-            extra = mapOf(
-                "type" to "album",
-                "album_id" to info.albumID.toString(),
-                "album_mid" to albumMid,
-                "company" to detail.album.data.company.name,
-                "publish_time" to info.publishDate,
-            ),
+            extra = buildMap {
+                put("type", "album")
+                put("album_id", info.albumID.toString())
+                put("album_mid", albumMid)
+                put("company", detail.album.data.company.name)
+                put("publish_time", info.publishDate)
+                // 专辑页的歌手入口、“更多专辑”用
+                detail.album.data.singer.singerList.firstOrNull { it.mid.isNotBlank() }?.let { put("artist_id", it.mid) }
+                if (info.albumType.isNotBlank()) put("album_type", info.albumType.trim())
+            },
         )
         return playlist to songs
     }
@@ -1568,53 +1844,18 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
         )
     }
 
+    /**
+     * 会员判断直接从音质探测结果推导：能拿到 VIP 档就说明账号有会员。
+     * 单独探一个 128k 地址只能说明“能播”，分不出会员。
+     */
     private suspend fun isVipAccount(cookie: String): Boolean {
         if (cookie.isBlank()) return false
         val cacheKey = NativeCrypto.md5Hex(cookie)
         vipCache[cacheKey]?.let { return it }
         return try {
-            val songMid = "004YZbkL2MNHoY"
-            val filename = "M500$songMid$songMid.mp3"
-            val body = buildJsonObject {
-                putJsonObject("comm") {
-                    put("cv", 4747474)
-                    put("ct", 24)
-                    put("format", "json")
-                    put("inCharset", "utf-8")
-                    put("outCharset", "utf-8")
-                    put("notice", 0)
-                    put("platform", "yqq.json")
-                    put("needNewCode", 1)
-                    put("uin", 0)
-                }
-                putJsonObject("req_1") {
-                    put("module", "music.vkey.GetVkey")
-                    put("method", "UrlGetVkey")
-                    putJsonObject("param") {
-                        put("guid", randomGuid())
-                        putJsonArray("songmid") { add(JsonPrimitive(songMid)) }
-                        putJsonArray("songtype") { add(JsonPrimitive(0)) }
-                        put("uin", "0")
-                        put("loginflag", 1)
-                        put("platform", "20")
-                        putJsonArray("filename") { add(JsonPrimitive(filename)) }
-                    }
-                }
-            }
-            val response = NativeHttp.postJson(
-                QQ_MUSICU_API,
-                body.toString(),
-                headers = mapOf("Referer" to QQ_DOWNLOAD_REFERER),
-                cookie = cookie,
-                randomIp = true,
-                userAgent = QQ_USER_AGENT,
-            )
-            val parsed = json.decodeFromString<QQVkeyResponse>(response.body)
-            val isVip = parsed.req1.data.midUrlInfo.firstOrNull()?.purl?.isNotEmpty() == true
-            if (!isVip && parsed.req1.code != 0) return false
-            vipCache[cacheKey] = isVip
-            isVip
-        } catch (_: Exception) {
+            availableQualityOptions(cookie).any { it.vip }
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
             false
         }
     }
@@ -1952,8 +2193,51 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
         )
     }
 
+    /**
+     * 建 QQ 二维码。优先走隐藏 WebView：ptqrlogin 被 QQ 网关按请求形状拦（只有浏览器
+     * 发的 script 标签请求过得去），本机 HTTP 客户端一律 403，所以轮询必须交给官方页面自己做。
+     * WebView 起不来（没有前台 Activity 等）时退回原生取码，二维码至少能显示。
+     */
     private suspend fun createQqLogin(sessionId: String): QRCreateResult {
-        logQqLogin(sessionId, "create", "begin")
+        val pageUrl = qqLoginPageUrl()
+        val pageUp = runCatching { QQLoginPage.begin(pageUrl) }.getOrDefault(false)
+        if (pageUp) {
+            val imageUrl = QQLoginPage.qrImageUrl()
+            // 图必须从页面里读：ptqrshow 每调一次就换一张码，自己拉到的和页面轮询的那张对不上
+            val dataUrl = if (imageUrl.isNotEmpty()) QQLoginPage.qrImageDataUrl() else ""
+            if (imageUrl.isNotEmpty() && dataUrl.isNotEmpty()) {
+                loginSessions[sessionId] = QQLoginState(QQ_MODE_WEB, mapOf("qr" to imageUrl))
+                return QRCreateResult(
+                    sessionId = sessionId,
+                    session = QRSession(
+                        key = qqQuery("mode" to QQ_MODE_WEB),
+                        url = pageUrl,
+                        imageUrl = dataUrl,
+                    ),
+                )
+            }
+            QQLoginPage.close()
+        }
+        return createQqLoginNative(sessionId)
+    }
+
+    /** 官方登录页地址：参数与原生预热那一套一致，s_url 指向 QQ 音乐的 OAuth 回跳。 */
+    private fun qqLoginPageUrl(): String = QQ_QR_LOGIN_PAGE_API + "?" + qqQuery(
+        "appid" to "716027609",
+        "daid" to "383",
+        "style" to "33",
+        "login_text" to "登录",
+        "hide_title_bar" to "1",
+        "hide_border" to "1",
+        "target" to "self",
+        "s_url" to QQ_OAUTH_LOGIN_JUMP,
+        "pt_3rd_aid" to QQ_OAUTH_CLIENT_ID,
+        "pt_feedback_link" to "https://support.qq.com/products/77942?customInfo=.appid$QQ_OAUTH_CLIENT_ID",
+        "theme" to "2",
+        "verify_theme" to "",
+    )
+
+    private suspend fun createQqLoginNative(sessionId: String): QRCreateResult {
         val warmupQuery = qqQuery(
             "appid" to "716027609",
             "daid" to "383",
@@ -1974,12 +2258,10 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
                 QQ_QR_LOGIN_PAGE_API + "?" + warmupQuery,
                 headers = mapOf("Accept" to "*/*"),
                 userAgent = QQ_LOGIN_USER_AGENT,
-                diagnostic = { logQqLogin(sessionId, "warmup", it) },
             )
-        }.onFailure { logQqLogin(sessionId, "warmup", "ignored failure type=${it.javaClass.simpleName}") }
-            .getOrNull()?.cookies?.forEach { (key, value) ->
-                if (value.isNotBlank()) cookies[key] = value
-            }
+        }.getOrNull()?.cookies?.forEach { (key, value) ->
+            if (value.isNotBlank()) cookies[key] = value
+        }
 
         val showQuery = qqQuery(
             "appid" to "716027609",
@@ -2002,23 +2284,18 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
             cookie = joinCookies(cookies),
             userAgent = QQ_LOGIN_USER_AGENT,
             binary = true,
-            diagnostic = { logQqLogin(sessionId, "qr-show", it) },
         )
         showResponse.cookies.forEach { (key, value) ->
             if (value.isNotBlank()) cookies[key] = value
         }
         val qrsig = cookies["qrsig"]?.trim().orEmpty()
-        logQqLogin(
-            sessionId, "create",
-            "qrBytes=${showResponse.bytes.size} cookies=${NativeHttp.describeCookiesForLog(cookies)}",
-        )
         if (qrsig.isEmpty()) throw IllegalStateException("qq qr show missing qrsig")
         val loginSig = cookies["pt_login_sig"]?.trim().orEmpty()
         val keyParams = linkedMapOf("qrsig" to qrsig)
         if (loginSig.isNotEmpty()) keyParams["login_sig"] = loginSig
         val encodedState = encodeCookieState(cookies)
         if (encodedState.isNotEmpty()) keyParams["session"] = encodedState
-        loginSessions[sessionId] = QQLoginState("qq", cookies)
+        loginSessions[sessionId] = QQLoginState(QQ_MODE_NATIVE, cookies)
         return QRCreateResult(
             sessionId = sessionId,
             session = QRSession(
@@ -2032,7 +2309,7 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
         )
     }
 
-    private suspend fun checkQqLogin(sessionId: String, key: String): QRCheckResult {
+    private suspend fun checkQqLogin(key: String): QRCheckResult {
         val params = parseQuery(key)
         val qrsig = params["qrsig"]?.trim().orEmpty()
         if (qrsig.isEmpty()) throw IllegalArgumentException("qq qr login key missing qrsig")
@@ -2068,7 +2345,6 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
             ),
             cookie = joinCookies(initialCookies),
             userAgent = QQ_LOGIN_USER_AGENT,
-            diagnostic = { logQqLogin(sessionId, "poll", it) },
         )
         val matches = Regex("'([^']*)'").findAll(response.body).map { it.groupValues[1] }.toList()
         val code: String
@@ -2090,12 +2366,6 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
             "67" -> "scanned"
             else -> "failed"
         }
-        logQqLogin(
-            sessionId, "poll",
-            "status=$status code=${code.toIntOrNull()} callbackFields=${matches.size} " +
-                "redirect=${NativeHttp.describeUrlForLog(redirectUrl)} " +
-                "receivedCookies=${NativeHttp.describeCookiesForLog(response.cookies)}",
-        )
         if (status != "success") return QRCheckResult(status = status, message = message, cookie = "")
         response.cookies.forEach { (name, value) ->
             if (value.isNotBlank()) initialCookies[name] = value
@@ -2103,49 +2373,44 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
         if (redirectUrl.isEmpty()) {
             return QRCheckResult("failed", "qq login redirect url missing", "")
         }
-        return finishQqLogin(sessionId, initialCookies, redirectUrl, message)
+        return finishQqLogin(initialCookies, redirectUrl, message)
     }
 
     private suspend fun finishQqLogin(
-        sessionId: String,
         cookies: MutableMap<String, String>,
         redirectUrl: String,
         message: String,
     ): QRCheckResult {
         return try {
-            val cookieJar = QQLoginCookieJar()
-            logQqLogin(sessionId, "landing", "cookieScope=domain/path inputCookies=${NativeHttp.describeCookiesForLog(cookies)}")
-            val landing = NativeHttp.getResponse(
-                redirectUrl,
-                headers = mapOf(
-                    "Referer" to "https://xui.ptlogin2.qq.com/",
-                    "Accept" to "*/*",
-                ),
-                cookie = joinCookies(cookies),
-                userAgent = QQ_LOGIN_USER_AGENT,
-                diagnostic = { logQqLogin(sessionId, "landing", it) },
-                cookieJar = cookieJar,
-            )
-            // check_sig 同时设置 graph.qq.com 的 p_skey，并删除 qq.com 的同名项，不能先按名称压平。
-            cookies.putAll(cookieJar.cookiesFor(QQ_OAUTH_AUTHORIZE))
-            cookies.putAll(cookieJar.cookiesFor(QQ_MUSICU_API))
-            logQqLogin(
-                sessionId, "landing",
-                "mergedCookies=${NativeHttp.describeCookiesForLog(cookies)} " +
-                    "finalUrl=${NativeHttp.describeUrlForLog(landing.finalUrl)} " +
-                    "html=${landing.body.trimStart().startsWith("<")} " +
-                    "hasJsRedirect=${Regex("location\\s*[.=]|http-equiv\\s*=\\s*['\"]?refresh", RegexOption.IGNORE_CASE).containsMatchIn(landing.body)}",
-            )
-            // QQ 授权的 p_skey 不是 QQ 音乐凭证，必须完成后面的授权码兑换。
-            if (hasQqMusicKey(cookies)) {
-                logQqLogin(sessionId, "complete", "success via landing cookies")
-                return QRCheckResult("success", message, joinCookies(normalizeQQMusicCookies(cookies)))
+            // 跳转必须自己跟着走：OkHttp 自动跟随只暴露最终响应的 Set-Cookie，
+            // 而 p_skey 是 ptlogin 在中间某一跳种下的，自动跟随会把它整个丢掉
+            followQQRedirects(redirectUrl, cookies, "https://xui.ptlogin2.qq.com/")
+            authorizeQQMusicLogin(cookies, message)
+        } catch (error: Exception) {
+            QRCheckResult("failed", error.message ?: "qq login failed", "")
+        }
+    }
+
+    /**
+     * 拿 ptlogin 的登录态换 QQ 音乐的 key：先 authorize 拿 code，再 musicu.fcg 换 qm_keyst。
+     * 原生通道和 WebView 通道走到这里汇合（WebView 只负责把轮询那步扛过去）。
+     */
+    private suspend fun authorizeQQMusicLogin(
+        cookies: MutableMap<String, String>,
+        message: String,
+    ): QRCheckResult {
+        return try {
+            val early = normalizeQQMusicCookies(cookies)
+            if (firstNonEmpty(
+                    early["qm_keyst"].orEmpty(),
+                    early["qqmusic_key"].orEmpty(),
+                    early["musickey"].orEmpty(),
+                ).isNotEmpty()
+            ) {
+                return QRCheckResult("success", message, joinCookies(early))
             }
-            val pSkey = cookies["p_skey"]?.trim().orEmpty()
-            if (pSkey.isEmpty()) {
-                logQqLogin(sessionId, "complete", "failed: missing p_skey after landing")
-                return QRCheckResult("failed", "qq login missing p_skey", "")
-            }
+            val pSkey = firstNonEmpty(cookies["p_skey"].orEmpty(), cookies["skey"].orEmpty()).trim()
+            if (pSkey.isEmpty()) return QRCheckResult("failed", "qq login missing p_skey", "")
 
             val form = linkedMapOf(
                 "response_type" to "code",
@@ -2170,22 +2435,21 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
                     "Origin" to "https://graph.qq.com",
                     "Accept" to "*/*",
                 ),
+                cookie = joinCookies(cookies),
                 userAgent = QQ_LOGIN_USER_AGENT,
-                diagnostic = { logQqLogin(sessionId, "authorize", it) },
-                cookieJar = cookieJar,
+                // authorize 用 302 回跳，自动跟随会把带 code 的 Location 一起吃掉
+                followRedirects = false,
             )
-            cookies.putAll(cookieJar.cookiesFor(QQ_OAUTH_AUTHORIZE))
-            cookies.putAll(cookieJar.cookiesFor(QQ_MUSICU_API))
-            val code = firstNonEmpty(
-                parseQuery(URI(authorize.finalUrl).rawQuery.orEmpty())["code"].orEmpty(),
-                Regex("[?&]code=([^&\"'\\s]+)").find(authorize.body)?.groupValues?.get(1).orEmpty(),
-            )
-            logQqLogin(
-                sessionId, "authorize",
-                "codePresent=${code.isNotEmpty()} mergedCookies=${NativeHttp.describeCookiesForLog(cookies)}",
-            )
+            authorize.cookies.forEach { (name, value) ->
+                if (value.isNotBlank()) cookies[name] = value
+            }
+            // code 在 Location 的 query 里；个别分支直接回 200 的页面，那就退回扫 body
+            val landing = resolveQQUrl(authorize.finalUrl, authorize.location)
+            val code = uriQueryValue(runCatching { URI(landing) }.getOrNull() ?: URI(QQ_OAUTH_AUTHORIZE), "code")
+                .ifEmpty {
+                    Regex("[?&]code=([^&\"'\\s]+)").find(authorize.body)?.groupValues?.get(1).orEmpty()
+                }
             if (code.isEmpty()) {
-                logQqLogin(sessionId, "complete", "failed: oauth authorize missing code")
                 return QRCheckResult("failed", "qq oauth authorize missing code", "")
             }
 
@@ -2209,13 +2473,13 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
                     "Referer" to "https://y.qq.com/",
                     "Accept" to "*/*",
                 ),
+                cookie = joinCookies(cookies),
                 userAgent = QQ_LOGIN_USER_AGENT,
-                diagnostic = { logQqLogin(sessionId, "music-login", it) },
-                cookieJar = cookieJar,
             )
-            cookies.putAll(cookieJar.cookiesFor(QQ_MUSICU_API))
+            login.cookies.forEach { (name, value) ->
+                if (value.isNotBlank()) cookies[name] = value
+            }
             val parsed = json.decodeFromString<QQWxLoginResponse>(login.body)
-            logQqLogin(sessionId, "music-login", "apiCode=${parsed.code} reqCode=${parsed.req.code}")
             if (parsed.code != 0 || parsed.req.code != 0) {
                 val errorMessage = firstNonEmpty(parsed.req.message, parsed.req.msg, parsed.message, parsed.msg)
                 return QRCheckResult(
@@ -2227,52 +2491,19 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
             for ((name, value) in qqWxLoginDataCookies(parsed.req.data)) {
                 if (cookies[name].isNullOrEmpty()) cookies[name] = value
             }
-            if (!hasQqMusicKey(cookies)) {
-                logQqLogin(sessionId, "complete", "failed: missing qm_keyst")
+            val normalized = normalizeQQMusicCookies(cookies)
+            if (firstNonEmpty(
+                    normalized["qm_keyst"].orEmpty(),
+                    normalized["qqmusic_key"].orEmpty(),
+                    normalized["musickey"].orEmpty(),
+                ).isEmpty()
+            ) {
                 return QRCheckResult("failed", "qq music login missing qm_keyst", "")
             }
-            val normalized = normalizeQQMusicCookies(cookies)
-            logQqLogin(sessionId, "complete", "success cookies=${NativeHttp.describeCookiesForLog(normalized)}")
             QRCheckResult("success", message, joinCookies(normalized))
         } catch (error: Exception) {
-            logQqLogin(sessionId, "complete", "exception type=${error.javaClass.simpleName}")
             QRCheckResult("failed", error.message ?: "qq login failed", "")
         }
-    }
-
-    private fun logQqLogin(sessionId: String, stage: String, detail: String) {
-        // AppLog 供应用内导出，Logcat 供这次模拟器联调；两边都不写凭证值或响应正文。
-        val message = "session=${sessionId.takeLast(8)} stage=$stage $detail"
-        AppLog.i("QQLogin", message)
-        Log.i("QQLogin", message)
-    }
-
-    private fun hasQqMusicKey(cookies: Map<String, String>): Boolean =
-        listOf("qm_keyst", "qqmusic_key", "musickey", "music_key").any { !cookies[it].isNullOrBlank() }
-
-    /** 仅用于一次 QQ 授权链，域名或路径不同的同名 Cookie 互不覆盖。 */
-    private class QQLoginCookieJar : CookieJar {
-        private val stored = LinkedHashMap<Triple<String, String, String>, Cookie>()
-
-        @Synchronized
-        override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-            val now = System.currentTimeMillis()
-            for (cookie in cookies) {
-                val key = Triple(cookie.domain, cookie.path, cookie.name)
-                if (cookie.expiresAt <= now) stored.remove(key) else stored[key] = cookie
-            }
-        }
-
-        @Synchronized
-        override fun loadForRequest(url: HttpUrl): List<Cookie> {
-            val now = System.currentTimeMillis()
-            stored.entries.removeAll { it.value.expiresAt <= now }
-            return stored.values.filter { it.matches(url) }
-                .sortedWith(compareByDescending<Cookie> { it.path.length }.thenByDescending { it.domain.length })
-        }
-
-        fun cookiesFor(url: String): Map<String, String> =
-            loadForRequest(url.toHttpUrl()).asReversed().associate { it.name to it.value }
     }
 
     private suspend fun createWxLogin(sessionId: String): QRCreateResult {
@@ -2297,7 +2528,7 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
             "uuid" to uuid,
             "state" to state,
         )
-        loginSessions[sessionId] = QQLoginState("wx", emptyMap())
+        loginSessions[sessionId] = QQLoginState(QQ_MODE_WX, emptyMap())
         return QRCreateResult(
             sessionId = sessionId,
             session = QRSession(
@@ -2509,6 +2740,8 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
     private fun extractQQPlaylistId(link: String): String? {
         val trimmed = link.trim()
         if (trimmed.isEmpty()) return null
+        // 直接输入的纯数字歌单 ID（导入入口用），跳过链接抽取
+        if (trimmed.all { it in '0'..'9' }) return trimmed
         val parsed = runCatching { URI(trimmed) }.getOrNull()
         if (parsed != null) {
             val pathValue = parsed.path.orEmpty().lowercase()
@@ -2768,7 +3001,47 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
         return hash and 0x7fffffff
     }
 
-    private data class QQLoginState(val type: String, val cookies: Map<String, String>)
+    private data class QQLoginState(val mode: String, val cookies: Map<String, String>)
+
+    /**
+     * 手动跟随跳转，把每一跳的 Set-Cookie 都收进 [cookies]，返回最后落地的地址。
+     *
+     * QQ 扫码登录的 p_skey 是 ptlogin 在跳转链中间种下的，OkHttp 自动跟随只给最终响应的
+     * cookie，所以必须自己顺着 Location 走（Go 参考实现也是这么做的）。
+     */
+    private suspend fun followQQRedirects(
+        startUrl: String,
+        cookies: MutableMap<String, String>,
+        referer: String,
+        maxHops: Int = 8,
+    ): String {
+        var current = startUrl
+        var ref = referer
+        repeat(maxHops) {
+            val response = NativeHttp.getResponse(
+                current,
+                headers = mapOf("Referer" to ref, "Accept" to "*/*"),
+                cookie = joinCookies(cookies),
+                userAgent = QQ_LOGIN_USER_AGENT,
+                followRedirects = false,
+            )
+            response.cookies.forEach { (name, value) ->
+                if (value.isNotBlank()) cookies[name] = value
+            }
+            val location = response.location
+            if (location.isBlank()) return response.finalUrl
+            ref = response.finalUrl
+            current = resolveQQUrl(response.finalUrl, location)
+        }
+        return current
+    }
+
+    /** Location 可能是相对地址，按当前落地地址补全。 */
+    private fun resolveQQUrl(base: String, location: String): String {
+        val target = location.trim()
+        if (target.isEmpty()) return base
+        return runCatching { URI(base).resolve(target).toString() }.getOrDefault(target)
+    }
 
     private companion object {
         const val QQ_USER_AGENT =
@@ -2784,6 +3057,8 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
         const val QQ_DOWNLOAD_REFERER = "http://y.qq.com"
         const val QQ_LYRIC_REFERER = "https://y.qq.com/portal/player.html"
         const val QQ_COVER_PREFIX = "https://y.gtimg.cn/music/photo_new/T002R300x300M000"
+        /** 歌手头像：T001 只有 150 / 300 / 500 / 800 几档，1000 是 404。 */
+        const val QQ_SINGER_AVATAR_PREFIX = "https://y.gtimg.cn/music/photo_new/T001R800x800M000"
 
         const val QQ_MUSICU_API = "https://u.y.qq.com/cgi-bin/musicu.fcg"
         const val QQ_SEARCH_API = "http://c.y.qq.com/soso/fcgi-bin/search_for_qq_cp"
@@ -2823,6 +3098,19 @@ class QQProvider : BaseNativeProvider(QQ_INFO) {
         const val QQ_WX_REDIRECT_URI =
             "https://y.qq.com/portal/wx_redirect.html?login_type=2&surl=https://y.qq.com/"
         const val QQ_WX_APP_ID = "wx48db31d50e334801"
+
+        /** 扫码登录的三种通道：微信、QQ（隐藏 WebView）、QQ（原生取码，兜底）。 */
+        const val QQ_MODE_WX = "wx"
+        const val QQ_MODE_WEB = "qqweb"
+        const val QQ_MODE_NATIVE = "qq"
+
+        /** 登录态落在这些域下，授权前把它们都收进来。 */
+        val QQ_LOGIN_COOKIE_URLS = listOf(
+            "https://xui.ptlogin2.qq.com/",
+            "https://graph.qq.com/",
+            "https://y.qq.com/",
+            "https://u.y.qq.com/",
+        )
 
         val QQ_PLAYLIST_DETAIL_ENDPOINTS = listOf(
             "https://i.y.qq.com/qzone-music/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg",
@@ -2869,6 +3157,39 @@ internal fun qqMembershipLabel(data: JsonObject?): String? {
 
 @Serializable
 private data class QQSearchResponse(val data: QQSearchData = QQSearchData())
+
+/** 一个音质档在 vkey 接口里的 filename 前缀与扩展名。 */
+internal data class QQQualityCandidate(
+    val prefix: String,
+    val ext: String,
+    val quality: AudioQualityOption,
+)
+
+/** 探测账号音质权限用的固定曲目：热门且各档齐全，单曲缺档时换歌反而更不可靠。 */
+private const val QQ_QUALITY_PROBE_SONG_MID = "0039MnYb0qxYhV"
+
+internal val QQ_QUALITY_CANDIDATES: List<QQQualityCandidate> = listOf(
+    QQQualityCandidate("AI00", "flac", AudioQualityOption(AudioQuality.Master, "臻品母带", "flac", vip = true)),
+    QQQualityCandidate("Q001", "flac", AudioQualityOption(AudioQuality.Atmos51, "全景声 5.1", "flac", vip = true)),
+    QQQualityCandidate("Q000", "flac", AudioQualityOption(AudioQuality.Atmos, "全景声 2.0", "flac", vip = true)),
+    QQQualityCandidate("F000", "flac", AudioQualityOption(AudioQuality.Lossless, "无损音质", "flac", vip = true)),
+    QQQualityCandidate("O801", "ogg", AudioQualityOption(AudioQuality.Ultra, "超高品质", "ogg", 640, vip = true)),
+    QQQualityCandidate("M800", "mp3", AudioQualityOption(AudioQuality.High, "高品质", "mp3", 320)),
+    QQQualityCandidate("M500", "mp3", AudioQualityOption(AudioQuality.Standard, "标准音质", "mp3", 128)),
+)
+
+/** QQ 的可选音质档，从高到低；顺序就是自动选档的优先级。 */
+internal val QQ_QUALITY_LADDER: AudioQualityLadder = AudioQualityLadder.of(
+    QQ_QUALITY_CANDIDATES.map { it.quality },
+)
+
+/** 档位 → 请求的 filename 前缀；平台没有这一档时返回 null，由调用方按“不支持”处理。 */
+internal fun qqQualityCandidateFor(quality: AudioQuality): QQQualityCandidate? =
+    QQ_QUALITY_CANDIDATES.firstOrNull { it.quality.value == quality }
+
+/** vkey 接口按 filename 回 purl：前缀 + songmid + songmid + 扩展名。 */
+internal fun qqQualityFilename(songMid: String, candidate: QQQualityCandidate): String =
+    "${candidate.prefix}$songMid$songMid.${candidate.ext}"
 
 @Serializable
 private data class QQSearchData(val song: QQSearchSong = QQSearchSong())
@@ -2979,7 +3300,87 @@ private data class QQAlbumBasic(
     val albumName: String = "",
     val publishDate: String = "",
     val desc: String = "",
+    val albumType: String = "",
 )
+
+@Serializable
+private data class QQSingerDetailBatch(
+    val detail: QQSingerDetailNode = QQSingerDetailNode(),
+    val songs: QQSingerSongsNode = QQSingerSongsNode(),
+    val albums: QQSingerAlbumListNode = QQSingerAlbumListNode(),
+    val fans: QQConcernNumNode = QQConcernNumNode(),
+)
+
+@Serializable
+private data class QQSingerDetailNode(
+    val code: Int = 0,
+    val data: QQSingerDetailData = QQSingerDetailData(),
+)
+
+@Serializable
+private data class QQSingerDetailData(
+    @SerialName("singer_list") val singerList: List<QQSingerDetailItem> = emptyList(),
+)
+
+@Serializable
+private data class QQSingerDetailItem(
+    @SerialName("basic_info") val basicInfo: QQSingerBasicInfo = QQSingerBasicInfo(),
+    @SerialName("ex_info") val exInfo: QQSingerExInfo = QQSingerExInfo(),
+    val wiki: String = "",
+)
+
+@Serializable
+private data class QQSingerBasicInfo(
+    @SerialName("singer_mid") val singerMid: String = "",
+    val name: String = "",
+    @SerialName("singer_pmid") val singerPmid: String = "",
+)
+
+@Serializable
+private data class QQSingerExInfo(
+    val desc: String = "",
+    @SerialName("foreign_name") val foreignName: String = "",
+    val birthday: String = "",
+)
+
+@Serializable
+private data class QQSingerAlbumsResponse(val albums: QQSingerAlbumListNode = QQSingerAlbumListNode())
+
+@Serializable
+private data class QQSingerAlbumListNode(
+    val code: Int = 0,
+    val data: QQSingerAlbumListData = QQSingerAlbumListData(),
+)
+
+@Serializable
+private data class QQSingerAlbumListData(
+    val albumList: List<QQSingerAlbumItem> = emptyList(),
+    val total: Int = 0,
+)
+
+@Serializable
+private data class QQSingerAlbumItem(
+    val albumMid: String = "",
+    val albumName: String = "",
+    val publishDate: String = "",
+    val albumType: String = "",
+    val totalNum: Int = 0,
+    val singerName: String = "",
+)
+
+@Serializable
+private data class QQConcernNumNode(
+    val code: Int = 0,
+    val data: QQConcernNumData = QQConcernNumData(),
+)
+
+@Serializable
+private data class QQConcernNumData(
+    @SerialName("map_singer_num") val mapSingerNum: Map<String, QQConcernNum> = emptyMap(),
+)
+
+@Serializable
+private data class QQConcernNum(@SerialName("user_fansnum") val userFansnum: Long = 0)
 
 @Serializable
 private data class QQCompany(val name: String = "")

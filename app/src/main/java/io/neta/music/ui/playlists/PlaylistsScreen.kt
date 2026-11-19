@@ -41,6 +41,7 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.CircularProgressIndicator
@@ -89,6 +90,7 @@ import io.neta.music.ui.PlaylistMode
 import io.neta.music.ui.PlaylistsUiState
 import io.neta.music.ui.charts.DiscoverCard
 import io.neta.music.ui.charts.DiscoverErrorState
+import io.neta.music.ui.library.LinkImportDialog
 import io.neta.music.ui.charts.GridRow
 import io.neta.music.ui.charts.ProviderChips
 import io.neta.music.ui.charts.SkeletonCardGrid
@@ -119,10 +121,21 @@ fun PlaylistsScreen(
 ) {
     // 来源条按设置里的音乐源顺序排（见 MusicUiState.sources）
     val sources = state.sources { it.recommendedPlaylists || it.playlistCategories || it.listeningModes }
+    var importOpen by remember { mutableStateOf(false) }
+    val openImport = { importOpen = true }
     if (LocalAppWindow.current.isTv) {
-        TvPlaylists(playlists, sources, actions, onOpenSearch)
+        TvPlaylists(playlists, sources, actions, onOpenSearch, openImport)
     } else {
-        PhonePlaylists(playlists, sources, actions, onOpenSearch, categoryEnd)
+        PhonePlaylists(playlists, sources, actions, onOpenSearch, categoryEnd, openImport)
+    }
+    if (importOpen) {
+        LinkImportDialog(
+            isLink = actions::isLink,
+            providers = state.providers,
+            defaultProviderId = playlists.providerId,
+            onImport = actions::importPlaylist,
+            onDismiss = { importOpen = false },
+        )
     }
 }
 
@@ -176,6 +189,7 @@ private fun PhonePlaylists(
     actions: MusicActions,
     onOpenSearch: () -> Unit,
     categoryEnd: Boolean,
+    onImportPlaylist: () -> Unit,
 ) {
     val window = LocalAppWindow.current
     val gutter = window.gutter
@@ -190,6 +204,7 @@ private fun PhonePlaylists(
             if (window.isTablet && (playlists.canCategorize || playlists.canListen)) {
                 ModeToggle(playlists, actions::setPlaylistMode, Modifier.width(if (playlists.canListen) 400.dp else 240.dp))
             }
+            IconButton(onClick = onImportPlaylist) { Icon(Icons.Filled.Link, "导入歌单") }
             IconButton(onClick = onOpenSearch) { Icon(Icons.Filled.Search, "搜索歌单") }
         },
     ) { padding ->
@@ -798,6 +813,7 @@ private fun TvPlaylists(
     sources: List<ProviderInfo>,
     actions: MusicActions,
     onOpenSearch: () -> Unit,
+    onImportPlaylist: () -> Unit,
 ) {
     val gutter = LocalAppWindow.current.gutter
     Column(Modifier.fillMaxSize().padding(top = 28.dp)) {
@@ -809,6 +825,9 @@ private fun TvPlaylists(
             Column(Modifier.weight(1f)) {
                 Text("歌单", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
                 Text(playlistsSubtitle(playlists), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+            }
+            IconButton(onClick = onImportPlaylist, modifier = Modifier.tvFocusRing(CircleShape)) {
+                Icon(Icons.Filled.Link, "导入歌单")
             }
             IconButton(onClick = onOpenSearch, modifier = Modifier.tvFocusRing(CircleShape)) {
                 Icon(Icons.Filled.Search, "搜索歌单")

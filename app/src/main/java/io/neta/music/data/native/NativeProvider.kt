@@ -1,5 +1,9 @@
 package io.neta.music.data.native
 
+import io.neta.music.data.AlbumDetail
+import io.neta.music.data.AlbumSummary
+import io.neta.music.data.ArtistAlbumPage
+import io.neta.music.data.ArtistDetail
 import io.neta.music.data.CollectionResult
 import io.neta.music.data.ListeningMode
 import io.neta.music.data.Playlist
@@ -47,17 +51,32 @@ interface NativeProvider {
     suspend fun parseSong(cookie: String, link: String): Song =
         throw UnsupportedOperationException("${info.name} 暂不支持歌曲链接解析")
 
-    suspend fun downloadUrl(cookie: String, song: Song): String =
+    /**
+     * 播放地址。[quality] 非 auto 时只准拿这一档，拿不到就报错——不静默降到低档，
+     * 否则用户选了无损、实际播的是 128k，界面上还看不出来。
+     */
+    suspend fun downloadUrl(cookie: String, song: Song, quality: AudioQuality = AudioQuality.Auto): String =
         throw UnsupportedOperationException("${info.name} 暂不支持播放地址解析")
 
     /**
      * 交给播放器的地址。默认沿用 downloadUrl；需要下载后解密的平台（汽水加密流）
      * 会先把明文写到 [workDir] 并返回本地文件 URI。
      */
-    suspend fun playableStream(cookie: String, song: Song, workDir: File): PlayableStream {
-        val url = song.url.ifBlank { downloadUrl(cookie, song) }
+    suspend fun playableStream(
+        cookie: String,
+        song: Song,
+        workDir: File,
+        quality: AudioQuality = AudioQuality.Auto,
+    ): PlayableStream {
+        val url = song.url.ifBlank { downloadUrl(cookie, song, quality) }
         return PlayableStream(url = url, ext = song.ext.ifBlank { extensionFromUrl(url) }, bitrate = song.bitrate)
     }
+
+    /**
+     * 当前账号在这个平台上实际能选的音质档，从高到低。默认空表：界面只显示“自动”，
+     * 不暴露平台其实不支持的档位。移植自 music-lib 的 `provider.AudioQualityProvider`。
+     */
+    suspend fun availableQualityOptions(cookie: String): List<AudioQualityOption> = emptyList()
 
     suspend fun lyrics(cookie: String, song: Song): String =
         throw UnsupportedOperationException("${info.name} 暂不支持歌词")
@@ -98,6 +117,26 @@ interface NativeProvider {
     suspend fun parseAlbum(cookie: String, link: String): CollectionResult =
         throw UnsupportedOperationException("${info.name} 暂不支持专辑链接解析")
 
+    /**
+     * 歌手主页资料：头像、简介、歌曲 / 专辑 / 粉丝数。没有专门接口的平台不实现，
+     * 歌手页退回搜索结果里带的资料（名字、头像、歌曲数）。
+     */
+    suspend fun artistDetail(cookie: String, id: String): ArtistDetail =
+        throw UnsupportedOperationException("${info.name} 暂不支持歌手资料")
+
+    /**
+     * 歌手的专辑，按发行时间从新到旧；[page] 从 1 开始。不实现的平台由歌手页从歌手歌曲里按专辑归并。
+     */
+    suspend fun artistAlbums(cookie: String, id: String, page: Int, limit: Int): ArtistAlbumPage =
+        throw UnsupportedOperationException("${info.name} 暂不支持歌手专辑")
+
+    /**
+     * 专辑详情：头部资料（发行时间、厂牌、简介、主歌手 id）+ 曲目。
+     * 默认只有曲目，头部由调用方拿打开时带的名字、封面补；有专辑详情接口的平台覆写它。
+     */
+    suspend fun albumDetail(cookie: String, id: String): AlbumDetail =
+        AlbumDetail(AlbumSummary(id = id, name = "", source = info.id), albumSongs(cookie, id))
+
     suspend fun categories(cookie: String): List<PlaylistCategory> =
         throw UnsupportedOperationException("${info.name} 暂不支持歌单分类")
 
@@ -121,6 +160,13 @@ interface NativeProvider {
 
     suspend fun checkLogin(sessionId: String, key: String): QRCheckResult =
         throw UnsupportedOperationException("${info.name} 暂不支持扫码登录")
+
+    /** 放弃这次扫码登录：把平台侧占用的资源（隐藏 WebView、会话）释放掉。 */
+    fun cancelLogin(sessionId: String) = Unit
+
+    /** 用户名 + 密码登录，返回可直接存进平台账号的 Cookie 字符串。 */
+    suspend fun passwordLogin(username: String, password: String): String =
+        throw UnsupportedOperationException("${info.name} 暂不支持账号密码登录")
 
     /** 登录账号的昵称、头像、会员/等级；null 表示这个平台没有实现或资料不可用。 */
     suspend fun accountInfo(cookie: String): AccountInfo? = null

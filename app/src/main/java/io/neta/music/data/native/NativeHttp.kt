@@ -27,6 +27,8 @@ data class NativeResponse(
     val bytes: ByteArray = ByteArray(0),
     /** 跟随跳转后的最终地址，用于短链还原；没有发生跳转时与请求地址相同。 */
     val finalUrl: String = "",
+    /** 302 的 Location 原值；只有传了 followRedirects = false 的请求才可能有值。 */
+    val location: String = "",
 )
 
 object NativeHttp {
@@ -40,13 +42,27 @@ object NativeHttp {
         isLenient = true
     }
 
-    private val client = OkHttpClient.Builder()
+    /** 默认客户端；[MHubTls] 从这里派生出自带附加信任锚的那份。 */
+    internal val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .callTimeout(45, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
+        .build()
+
+    /**
+     * 不跟随跳转的客户端：OkHttp 自动跟随只把最终响应交出来，中间某一跳种下的 Set-Cookie 会丢掉
+     * （QQ 扫码登录的 p_skey 就是这样丢的），需要自己顺着 Location 走时用这个。
+     */
+    private val noRedirectClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(45, TimeUnit.SECONDS)
+        .followRedirects(false)
+        .followSslRedirects(false)
         .build()
 
     suspend fun get(
@@ -64,6 +80,7 @@ object NativeHttp {
         randomIp: Boolean = false,
         userAgent: String = DEFAULT_USER_AGENT,
         binary: Boolean = false,
+        followRedirects: Boolean = true,
         diagnostic: ((String) -> Unit)? = null,
         cookieJar: CookieJar? = null,
     ): NativeResponse {
@@ -72,7 +89,7 @@ object NativeHttp {
             .get()
             .applyCommonHeaders(headers, cookie, randomIp, userAgent)
             .build()
-        return execute(request, binary, diagnostic, cookieJar)
+        return execute(request, binary, followRedirects, diagnostic, cookieJar)
     }
 
     suspend fun postForm(
@@ -82,6 +99,7 @@ object NativeHttp {
         cookie: String = "",
         randomIp: Boolean = false,
         userAgent: String = DEFAULT_USER_AGENT,
+        followRedirects: Boolean = true,
         diagnostic: ((String) -> Unit)? = null,
         cookieJar: CookieJar? = null,
     ): NativeResponse {
@@ -93,7 +111,7 @@ object NativeHttp {
             .post(body)
             .applyCommonHeaders(headers, cookie, randomIp, userAgent)
             .build()
-        return execute(request, diagnostic = diagnostic, cookieJar = cookieJar)
+        return execute(request, followRedirects = followRedirects, diagnostic = diagnostic, cookieJar = cookieJar)
     }
 
     suspend fun postJson(
@@ -204,9 +222,21 @@ object NativeHttp {
             "$name(len=$length,domain=${cookie?.domain},path=${cookie?.path},secure=${cookie?.secure})"
         }
 
+    /**
+     * 按请求地址挑客户端：MHub 的两个域名要用带附加信任锚的那份（它们的证书链挂在
+     * Let's Encrypt 的 YE 上，老系统的 CA 库里可能没有对应根），其余照旧。见 [MHubTls]。
+     */
+    private fun clientFor(request: Request, followRedirects: Boolean, cookieJar: CookieJar?): OkHttpClient {
+        if (request.url.host in MHubTls.hosts) return MHubTls.client
+        val base = if (followRedirects) client else noRedirectClient
+        // 只有显式提供的登录会话按域名管理 Cookie；原有调用继续使用无 CookieJar 的共享客户端。
+        return if (cookieJar == null) base else base.newBuilder().cookieJar(cookieJar).build()
+    }
+
     private suspend fun execute(
         request: Request,
         binary: Boolean = false,
+        followRedirects: Boolean = true,
         diagnostic: ((String) -> Unit)? = null,
         cookieJar: CookieJar? = null,
     ): NativeResponse =
@@ -215,9 +245,7 @@ object NativeHttp {
                 "request ${request.method} ${describeUrlForLog(request.url)} " +
                     "cookies=${describeRequestCookiesForLog(request)}"
             )
-            // 只有显式提供的登录会话按域名管理 Cookie；原有调用继续使用无 CookieJar 的共享客户端。
-            val requestClient = if (cookieJar == null) client else client.newBuilder().cookieJar(cookieJar).build()
-            val call = requestClient.newCall(request)
+            val call = clientFor(request, followRedirects, cookieJar).newCall(request)
             continuation.invokeOnCancellation { call.cancel() }
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, error: IOException) {
@@ -245,7 +273,9 @@ object NativeHttp {
                         val bytes = if (binary) runCatching { it.body?.bytes() }.getOrNull() ?: ByteArray(0) else ByteArray(0)
                         val body = if (binary) "" else runCatching { it.body?.string().orEmpty() }.getOrDefault("")
                         diagnostic?.invoke("body chars=${body.length} bytes=${bytes.size}")
-                        if (!it.isSuccessful) {
+                        // 手动跟随跳转时 3xx 是正常回包：Location 才是要读的东西
+                        val isRedirect = !followRedirects && it.code in 300..399
+                        if (!it.isSuccessful && !isRedirect) {
                             if (continuation.isActive) {
                                 continuation.resumeWithException(
                                     IOException("HTTP ${it.code} ${it.message}: ${body.take(300)}")
@@ -255,9 +285,9 @@ object NativeHttp {
                         }
                         val cookies = buildMap {
                             // 登录凭据可能在 302 响应里；按跳转顺序合并，让后续响应覆盖旧值。
-                            generateSequence(it) { response -> response.priorResponse }
-                                .toList().asReversed().forEach { response ->
-                                    response.headers.values("Set-Cookie").forEach { header ->
+                            generateSequence(it) { hop -> hop.priorResponse }
+                                .toList().asReversed().forEach { hop ->
+                                    hop.headers.values("Set-Cookie").forEach { header ->
                                         val pair = header.substringBefore(';').trim()
                                         val index = pair.indexOf('=')
                                         if (index > 0) {
@@ -268,7 +298,14 @@ object NativeHttp {
                         }
                         if (continuation.isActive) {
                             continuation.resume(
-                                NativeResponse(body, cookies, it.code, bytes, it.request.url.toString())
+                                NativeResponse(
+                                    body = body,
+                                    cookies = cookies,
+                                    code = it.code,
+                                    bytes = bytes,
+                                    finalUrl = it.request.url.toString(),
+                                    location = it.header("Location").orEmpty(),
+                                )
                             )
                         }
                     }
