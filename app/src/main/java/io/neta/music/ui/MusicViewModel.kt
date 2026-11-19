@@ -132,6 +132,7 @@ import io.neta.music.playback.VolumeNormalization
 import io.neta.music.widget.PlaybackSnapshot
 import io.neta.music.widget.SearchRequest
 import io.neta.music.widget.WidgetHub
+import io.neta.music.widget.WidgetLinks
 import io.neta.music.widget.WidgetTarget
 import io.neta.music.playback.VolumeNormalizationState
 import io.neta.music.recognize.AudioResampler
@@ -406,6 +407,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private var autoPauseInFlight = false
     /** 这之前收到的起播是应用自发的接续（启动自动播放、回前台续播），不算「主界面起播进歌词页」。 */
     private var autoLyricsSuppressUntil = 0L
+    /** 这之前刚拉起系统安装器：安装器把界面盖住不算离开应用，播放不停（见 [onAppBackgrounded] 和焦点续播）。 */
+    private var installKeepPlayingUntil = 0L
 
     /** 界面（MainActivity）打开过。组件、系统媒体控件拉起进程时不读榜单、不检查更新，等界面真正打开。 */
     private val uiLaunched = MutableStateFlow(false)
@@ -803,11 +806,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             uiLaunched.first { it }
             checkUpdatesInBackground()
         }
-        // 后台下载只收起进度；完成时应用在前台就自动打开安装器，否则回到应用时再打开。
+        // 后台下载只收起进度；完成时应用在前台就自动打开安装器；后台播放的也把应用带回
+        // 前台（路由到「关于与更新」），回到前台后 onAppForeground 的 Ready 分支接着拉安装器。
         viewModelScope.launch {
             updateState.map { it.phase }.distinctUntilChanged().collect { phase ->
-                if (phase == UpdatePhase.Ready && ForegroundActivity.get() != null) {
+                if (phase != UpdatePhase.Ready) return@collect
+                if (ForegroundActivity.get() != null) {
                     launchUpdateInstaller()
+                } else {
+                    // 后台启动 Activity 受系统限制，被 ROM 拦下时还有下载完成的通知兜底（点击回应用）
+                    runCatching { app.startActivity(WidgetLinks.intent(app, WidgetTarget.Updates)) }
                 }
             }
         }
@@ -4733,6 +4741,19 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             }
             interruptedBySystem = reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS ||
                 reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY
+            // 车机的音频策略会在安装器盖上时抢走焦点：安装窗口里把播放接回去（拔耳机那种
+            // BECOMING_NOISY 不接，保持安全默认），装完或取消安装回到应用，音乐一直没停
+            if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS &&
+                SystemClock.elapsedRealtime() < installKeepPlayingUntil
+            ) {
+                viewModelScope.launch {
+                    delay(INSTALL_KEEP_PLAYING_RESUME_MS)
+                    val player = controller ?: return@launch
+                    if (!player.playWhenReady && player.mediaItemCount > 0 && player.playbackState != Player.STATE_ENDED) {
+                        player.play()
+                    }
+                }
+            }
         }
 
         override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
@@ -6399,6 +6420,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (installLaunching) return
         val file = updateState.value.file ?: return
         installLaunching = true
+        // 安装器会盖住应用：这段时间里播放不因「离开应用」或音频焦点被抢而停，安装窗口的
+        // 起播也不算「主界面起播进歌词页」
+        installKeepPlayingUntil = SystemClock.elapsedRealtime() + INSTALL_KEEP_PLAYING_MS
+        autoLyricsSuppressUntil = SystemClock.elapsedRealtime() + AUTO_LYRICS_SUPPRESS_MS
         try {
             val result = app.update.install(file)
             lastInstallOutcome = result
@@ -6481,6 +6506,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
      * 别的应用拉起来的前台界面）弹一下就一直停着。退出应用（finish）不算，回前台不自动放。
      */
     fun onAppBackgrounded(resumeOnReturn: Boolean = true) {
+        // 刚拉起系统安装器：安装器把界面盖住不算用户离开，播放不停，关掉安装页直接回到应用
+        if (SystemClock.elapsedRealtime() < installKeepPlayingUntil) return
         // 后台播放打开后电视和手机一个行为：谁都不拦，音乐接着放
         if (!isTvLayout() || settingsState.value.tvBackgroundPlay) return
         val player = controller?.takeIf { it.playWhenReady } ?: return
@@ -6634,6 +6661,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
         /** 自动接续播放后这段时间内的起播不算「主界面起播进歌词页」（给接续的 play() 事件留的窗口）。 */
         const val AUTO_LYRICS_SUPPRESS_MS = 4_000L
+
+        /** 拉起系统安装器后这段时间内播放不停；焦点被抢后隔这么久再接回去。 */
+        const val INSTALL_KEEP_PLAYING_MS = 30_000L
+        const val INSTALL_KEEP_PLAYING_RESUME_MS = 500L
 
         /** 授权页最多打开两次还装不上，就认定这台设备走不通那条路，转手动安装。 */
         const val MAX_INSTALL_PERMISSION_ATTEMPTS = 2
