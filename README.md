@@ -4,9 +4,11 @@
 
 - 应用名：吒友爱听
 - 包名：`io.neta.music`
-- 版本：`0.0.7 (7)`，由 [version.properties](version.properties) 统一维护
+- 版本：`0.0.14 (14)`，由 [version.properties](version.properties) 统一维护
 - 运行目标：Android 11（API 30）
 - 技术栈：Kotlin、Jetpack Compose / Material 3、Media3
+
+主要能力：洛雪自定义音源取流、手机远控局域网网页、美式奔奔 AI 的本机 MCP 点歌、外部广播点歌与控制、MediaSession 歌词输出、多源在线歌词兜底、歌单分享链接 / ID 导入。详见下文各节。
 
 ## 构建
 
@@ -16,7 +18,7 @@
 ./gradlew :app:assembleDebug
 ```
 
-APK 输出到 `app/build/outputs/apk/debug/neta-car-music-0.0.7-7.apk`。SDK 与依赖版本以 `gradle/libs.versions.toml` 为准。
+APK 输出到 `app/build/outputs/apk/debug/neta-car-music-0.0.14-14.apk`。SDK 与依赖版本以 `gradle/libs.versions.toml` 为准。
 
 正式签名包执行：
 
@@ -26,8 +28,8 @@ APK 输出到 `app/build/outputs/apk/debug/neta-car-music-0.0.7-7.apk`。SDK 与
 
 配置仓库根目录的 `keystore.jks`、`signing.properties` 或对应签名环境变量后，Release 构建会完成签名并自动输出：
 
-- 英文发布包：`app/build/outputs/apk/release/neta-car-music-0.0.7-7.apk`
-- 中文名副本：`app/build/outputs/local-apk/release/吒友爱听-0.0.7-7.apk`
+- 英文发布包：`app/build/outputs/apk/release/neta-car-music-0.0.14-14.apk`
+- 中文名副本：`app/build/outputs/local-apk/release/吒友爱听-0.0.14-14.apk`
 
 两份 APK 的内容和签名相同，文件名随 `version.properties` 自动变化。中文名副本只在配置 Release 签名后生成，不影响原有 Debug 构建或英文发布包。密钥和密码不入库，开发约定见 [AGENTS.md](AGENTS.md)。
 
@@ -35,6 +37,7 @@ APK 输出到 `app/build/outputs/apk/debug/neta-car-music-0.0.7-7.apk`。SDK 与
 
 向包 `io.neta.music` 发送 `io.neta.music.action.CONTROL` 广播，通过字符串 `command` 点歌、收藏或切换播放模式；参数及结果字段见 [PlaybackBroadcastReceiver](app/src/main/java/io/neta/music/playback/PlaybackBroadcastReceiver.kt) 的接口说明。
 
+- 点歌播放会插播到当前歌曲之后，不打断正在播放的歌曲。
 - Android 调用方可携带平台 `android.os.ResultReceiver` 参数 `result_receiver`，结果直接回到发起进程，无需注册结果广播接收器。
 - 本地回调若使用 `ResultReceiver` 的匿名或自定义子类，发送前须先调用其 `writeToParcel()`，再用 `ResultReceiver.CREATOR.createFromParcel()` 还原为系统类型；保留本地原回调，只把系统类型放入 Intent。直接传子类会让接收方查找发送应用的私有类，Android 11 连请求中的字符串参数也无法读取。
 - 点歌先返回 `accepted`，搜索及提交播放器后返回 `completed` 或 `error`；两阶段使用相同 `request_id`。受理不等于已经播放出声。
@@ -62,6 +65,25 @@ android.media.metadata.LYRIC String = 整首带时间戳 LRC，仅 ready 时存�
 - “通知栏歌词”可能把系统 artist 替换为歌词行；ARTIST 字段和 LRC 头仍取原歌曲歌手，接收端可在 ID 校验后用它稳定歌曲身份，避免每行重新加载。
 - 空歌词、无时间轴、加载失败或正文超过 131072 个 UTF-16 代码单元（约 256 KiB）时发布 `unavailable`，不截断成几行。接收端可回退到自身缓存或在线检索；`loading` 应有界等待，建议最多 2 秒。
 
+## 洛雪自定义音源
+
+应用内置洛雪（LX Music）音源运行时：独立原生模块 `lib-runtime-lx` 承载脚本引擎，脚本协议与调度在 `data/lx/`。首次冷启动自动导入内置音源（来自 pdone 合集），跳过已存在项、尊重数量上限，单个失败不中断。
+
+- 自定义音源为已有平台增加取流通道，不改变搜索和榜单来源；可添加在线地址、本地文件或内置音源。
+- 统一「洛雪」内部按脚本顺序尝试，全部脚本失败后按播放与换源设置继续回退。
+- 管理入口：设置 → 自定义音源（`ui/settings/LxSourcesSettings.kt`），支持测试、更新、排序和删除。
+
+## 手机远控
+
+局域网网页服务（端口 18790）：手机扫码即可搜歌点歌、双向剪贴板传输、向车机输入框扫码输入。实现在 `remote/`，页面打包为 `app/src/main/assets/remote/index.html`。
+
+- 主界面顶栏提供远控二维码入口；服务随应用自动启动，可在设置中关闭。
+- 仅在局域网内可信环境使用，不做令牌和会话校验。
+
+## MCP 点歌服务
+
+供同一台车机上的美式奔奔 AI 助手点歌：本机 `127.0.0.1:18766` 的无认证 Streamable HTTP MCP，提供 `play_song`、`get_playback_state` 两个工具。在设置 → 奔奔 AI 点歌中一键绑定；注册信息与协议细节见 [MusicMcpServer.kt](app/src/main/java/io/neta/music/mcp/MusicMcpServer.kt)。
+
 ## 歌词获取
 
 原平台歌词优先，本地歌完整保留现有同名 `.lrc`、匹配平台和云盘歌词的优先级。原流程没有有效同步歌词时，才使用移植自哪吒美式歌词助手的多源在线兜底：网易云、QQ、酷狗 PC/移动端、酷我、LrcLib，以及汽水歌曲的适用查询路径。
@@ -72,6 +94,10 @@ android.media.metadata.LYRIC String = 整首带时间戳 LRC，仅 ready 时存�
 - 结果回填原 `lyrics/lyricsKey`，播放页、通知歌词、小组件与 MediaSession 继续使用同一份结果，无需美式运行或新增跨应用接口。通知歌词缓存同时检查正文变化，支持同曲晚到的兜底歌词。
 
 实现入口为 `data/lyrics/LyricsFallback.kt`、`OnlineLyricsSources.kt` 与 `ui/MusicViewModel.kt` 的 `loadLyrics()`；本地歌词提供器及 `MusicRepository.lyrics()` 不承担跨平台兜底。
+
+## 歌单导入
+
+音乐库支持粘贴平台歌单分享链接，或输入歌单 ID 并选择平台导入；识别后打开详情并自动绑定为本地歌单，平台更新自动同步。见 `ui/library/LibraryScreen.kt` 的导入歌单入口。
 
 ## 发布与更新
 
@@ -85,13 +111,13 @@ android.media.metadata.LYRIC String = 整首带时间戳 LRC，仅 ready 时存�
 
 ```sh
 # 在 main 提交本次源码和版本后，使用项目内的说明文件准备正式签名包。
-python3 scripts/release.py prepare --notes build/releases/0.0.7/release-notes.md
+python3 scripts/release.py prepare --notes build/releases/0.0.14/release-notes.md
 
 # 用户确认说明后上传；脚本会展示本次说明，并要求输入完整版本标签确认。
 python3 scripts/release.py publish
 ```
 
-依赖 Python 3、已登录的 GitHub CLI（`gh`）、Git，以及本机构建环境。准备结果保存在 `dist/v0.0.7-7/`，包括正式 APK、`update.json`、`update.apk.sha256` 和本地发布说明。脚本只核对产物包名、版本和正式签名，计算一次更新所需的 SHA-256，不下载回验或重复编译。
+依赖 Python 3、已登录的 GitHub CLI（`gh`）、Git，以及本机构建环境。准备结果保存在 `dist/v0.0.14-14/`，包括正式 APK、`update.json`、`update.apk.sha256` 和本地发布说明。脚本只核对产物包名、版本和正式签名，计算一次更新所需的 SHA-256，不下载回验或重复编译。
 
 网络操作默认最多尝试 5 次，等待时间依次为 5、10、15、20 秒；可通过 `RELEASE_RETRIES`、`RELEASE_RETRY_DELAY` 调整。上传失败后直接重跑 `publish`，复用已签名产物；附件先上传到草稿，全部成功后才公开并设为最新版。
 
