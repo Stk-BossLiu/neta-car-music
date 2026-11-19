@@ -5702,8 +5702,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * 起播要进歌词页时先过这道闸：界面没起、应用自发的接续（[autoLyricsSuppressUntil]）、
      * 播放页或海报墙已经盖在主界面上（应用内点歌本来就会开播放页）、没歌在放、设置关了都不算。
+     * 外部点歌链路（远控网页的搜索结果点播）也调它补发信号。
      */
-    private fun maybeAutoLyricsView() {
+    internal fun maybeAutoLyricsView() {
         if (!uiLaunched.value || SystemClock.elapsedRealtime() < autoLyricsSuppressUntil) return
         val ui = base.value
         if (ui.playerOpen || ui.posterOpen || ui.current == null) return
@@ -5797,7 +5798,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             playRequestNext(track, pinned, requestId)
         }
         if (!started) error(base.value.playbackNotice.ifBlank { base.value.error.ifBlank { "暂时放不了这首" } })
-        return awaitPlaybackStart()
+        val playing = awaitPlaybackStart()
+        // 外部点歌（远控 / MCP / 广播）是明确的「我要听这首」：播放中插播没有暂停→播放的
+        // 边沿，起播信号收不到，这里补发一次，主界面上直接进歌词页
+        if (playing) maybeAutoLyricsView()
+        return playing
     }
 
     /** 手机远控网页的搜歌：直接用聚合引擎取结果列表，不动界面的搜索状态。 */

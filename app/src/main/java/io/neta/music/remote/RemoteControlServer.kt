@@ -112,7 +112,12 @@ internal class RemoteControlServer(private val app: MyMusicApp) : NanoHTTPD(null
             ?: return json(Response.Status.NOT_FOUND, JSONObject().put("success", false).put("message", "先搜索再点播，或重新搜索一次"))
         val queue = lastResults.map { it.second }
         runBlocking {
-            withContext(Dispatchers.Main) { runCatching { app.musicViewModel.play(song, queue, openPlayer = false) } }
+            withContext(Dispatchers.Main) {
+                runCatching { app.musicViewModel.play(song, queue, openPlayer = false) }
+                // 播放中点播没有暂停→播放的边沿，起播信号收不到，这里补发一次：
+                // 主界面上直接进歌词页（闸在 maybeAutoLyricsView 里，播放页开着就不动）
+                app.musicViewModel.maybeAutoLyricsView()
+            }
         }
         return jsonResponse(JSONObject().put("success", true).put("title", song.title))
     }
