@@ -43,9 +43,12 @@ import io.neta.music.aggregate.TrackNormalizer
 import io.neta.music.aggregate.TrackSource
 import io.neta.music.aggregate.availabilityOf
 import io.neta.music.data.AppSettings
+import io.neta.music.data.lx.LxPlatform
+import io.neta.music.data.lx.LxSources
 import io.neta.music.data.CachedAccountProfile
 import io.neta.music.data.CanonicalSourceEntity
 import io.neta.music.data.CanonicalTrackEntity
+import io.neta.music.data.CollectionResult
 import io.neta.music.data.DOWNLOAD_ACTIVE
 import io.neta.music.data.DOWNLOAD_DONE
 import io.neta.music.data.DOWNLOAD_FAILED
@@ -65,6 +68,20 @@ import io.neta.music.data.TabletopTop
 import io.neta.music.data.ListeningMode
 import io.neta.music.data.MiniPlayerTarget
 import io.neta.music.data.Playlist
+import io.neta.music.aggregate.TrackNormalizer
+import io.neta.music.data.AlbumSummary
+import io.neta.music.data.toAlbumSummary
+import io.neta.music.ui.artist.ArtistPages
+import io.neta.music.ui.artist.ArtistUiState
+import io.neta.music.ui.artist.MAX_COLLECTION_PAGES
+import io.neta.music.ui.artist.albumIdOf
+import io.neta.music.ui.artist.collectionKey
+import io.neta.music.ui.artist.hasHeaderInfo
+import io.neta.music.ui.artist.mergeAlbumHeader
+import io.neta.music.ui.artist.parseCollectionKey
+import io.neta.music.ui.artist.pickAlbum
+import io.neta.music.ui.artist.pickArtist
+import io.neta.music.ui.artist.splitArtistNames
 import io.neta.music.data.PlaylistCategory
 import io.neta.music.data.PlaylistEntity
 import io.neta.music.data.PlaylistEntryEntity
@@ -89,6 +106,7 @@ import io.neta.music.data.local.forStorage
 import io.neta.music.data.TopList
 import io.neta.music.data.TrackOverrideEntity
 import io.neta.music.data.native.AppleLyricsConfig
+import io.neta.music.data.native.AudioQuality
 import io.neta.music.data.native.KugouProvider
 import io.neta.music.data.native.NativeProviders
 import io.neta.music.data.native.NetEaseProvider
@@ -99,6 +117,9 @@ import io.neta.music.data.update.InstallResult
 import io.neta.music.data.update.UpdatePhase
 import io.neta.music.data.update.UpdateDownloadService
 import io.neta.music.data.update.UpdateUiState
+import io.neta.music.lyricon.LyriconController
+import io.neta.music.lyricon.LyriconMapper
+import io.neta.music.lyricon.LyriconTrackInput
 import io.neta.music.playback.AppleWidevineDrmCallback
 import io.neta.music.playback.CrossfadeHandoff
 import io.neta.music.playback.MEDIA_EXTRA_DURATION_MS
@@ -112,6 +133,7 @@ import io.neta.music.playback.VolumeNormalization
 import io.neta.music.widget.PlaybackSnapshot
 import io.neta.music.widget.SearchRequest
 import io.neta.music.widget.WidgetHub
+import io.neta.music.widget.WidgetLinks
 import io.neta.music.widget.WidgetTarget
 import io.neta.music.playback.VolumeNormalizationState
 import io.neta.music.recognize.AudioResampler
@@ -203,6 +225,10 @@ data class MusicUiState(
     /** 冷启动打开的顶层入口（TopTab.route），空表示还没读到设置。 */
     val startupTab: String = "",
     val autoPlayOnLaunch: Boolean = true,
+    /** 主界面无操作自动进歌词页：闲置计时和起播跳转共用这一个开关。 */
+    val autoLyricsIdle: Boolean = true,
+    /** 主界面多少秒无操作后自动进歌词页。 */
+    val autoLyricsIdleSeconds: Int = 30,
     /** 歌单页上次用的浏览方式；还没读到设置时是默认的「推荐」。 */
     val playlistsMode: PlaylistMode = PlaylistMode.Recommend,
     /** 听歌模式页上次选的分组，空表示「全部」。 */
@@ -211,6 +237,8 @@ data class MusicUiState(
     val appearance: Appearance = Appearance(),
     val lyricsBackground: LyricsBackgroundMode = LyricsBackgroundMode.Ambient,
     val notificationLyrics: Boolean = false,
+    val lyriconProviderEnabled: Boolean = true,
+    val lyriconSubscriberEnabled: Boolean = false,
     /** Apple Music 匿名歌词是否走第三方中转；见 [setThirdPartyLyrics]。 */
     val thirdPartyLyrics: Boolean = true,
     val rhythmIntensity: RhythmIntensity = RhythmIntensity.Standard,
@@ -247,6 +275,8 @@ data class MusicUiState(
     val cacheLimitMb: Int = 512,
     val reduceMotion: Boolean = false,
     val volumeNormalization: Boolean = false,
+    /** 播放音质偏好（AudioQuality.id）；平台不支持所选档位时按 auto 取。 */
+    val audioQuality: String = AudioQuality.Auto.id,
     val showBottomNav: Boolean = true,
     val cookies: Map<String, String> = emptyMap(),
     val sodaSignerUrl: String = "",
@@ -376,6 +406,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     /** 自己刚调的 pause（离开应用自动暂停）：别被 onPlayWhenReadyChanged 当成用户按的暂停清掉账。 */
     private var autoPauseInFlight = false
+    /** 这之前收到的起播是应用自发的接续（启动自动播放、回前台续播），不算「主界面起播进歌词页」。 */
+    private var autoLyricsSuppressUntil = 0L
+    /** 这之前刚拉起系统安装器：安装器把界面盖住不算离开应用，播放不停（见 [onAppBackgrounded] 和焦点续播）。 */
+    private var installKeepPlayingUntil = 0L
 
     /** 界面（MainActivity）打开过。组件、系统媒体控件拉起进程时不读榜单、不检查更新，等界面真正打开。 */
     private val uiLaunched = MutableStateFlow(false)
@@ -393,6 +427,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     /** 打开播放页时直接切到歌词视图（组件的歌词区域）。 */
     val lyricsViewRequest: StateFlow<Boolean> = _lyricsView.asStateFlow()
+    private val _autoLyrics = MutableStateFlow(false)
+
+    /**
+     * 主界面上的起播（暂停→播放，含方向盘、语音这类外部控制）要直接进歌词页。
+     * 界面消费后清空：旋转重建、晚订阅拿到的都是「无请求」，不会拿旧值再跳一次。
+     */
+    val autoLyricsView: StateFlow<Boolean> = _autoLyrics.asStateFlow()
     private val _searchRequest = MutableStateFlow<SearchRequest?>(null)
     val searchRequest: StateFlow<SearchRequest?> = _searchRequest.asStateFlow()
     private var loginJob: Job? = null
@@ -418,7 +459,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val cookie: String,
         var appending: Boolean = false,
     )
-    private var collectionGeneration = 0
     private var failoverInProgress = false
 
     /** 本轮播放里已经试过并失败的平台（按曲目）：换源重试要累积排除，不然会在两个源之间来回切。 */
@@ -432,6 +472,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private var mergeTargets: Map<String, String> = emptyMap()
     private var aggregateSongs: Map<String, List<Song>> = emptyMap()
     private val pinnedProviders = mutableMapOf<String, String>()
+    /** 本次队列实际解析出的来源；洛雪是组合源，不能只靠歌曲 key 反查原生平台。 */
+    private val resolvedSources = mutableMapOf<String, TrackSource>()
     private val aggregateDao = app.database.aggregate()
     private val libraryDao = app.database.library()
 
@@ -458,6 +500,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     // 播放进度单独成流：每 100ms 更新一次，放在 MusicUiState 里会让所有页面跟着重组
     private val _position = MutableStateFlow(0L)
     val position: StateFlow<Long> = _position
+
+    private val lyricon = LyriconController(application)
+    internal val lyriconSubscription = lyricon.subscription
 
     val syncState = app.sync.state
     val syncEvents = app.sync.events
@@ -556,12 +601,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             playlistsSource = settings.playlistsSource,
             startupTab = settings.startupTab,
             autoPlayOnLaunch = settings.autoPlayOnLaunch,
+            autoLyricsIdle = settings.autoLyricsIdle,
+            autoLyricsIdleSeconds = settings.autoLyricsIdleSeconds,
             playlistsMode = settings.playlistsMode.toPlaylistMode(),
             listenGroup = settings.listenGroup.ifBlank { "全部" },
             theme = settings.theme,
             appearance = settings.toAppearance(),
             lyricsBackground = settings.lyricsBackground,
             notificationLyrics = settings.notificationLyrics,
+            lyriconProviderEnabled = settings.lyriconProviderEnabled,
+            lyriconSubscriberEnabled = settings.lyriconSubscriberEnabled,
             thirdPartyLyrics = settings.thirdPartyLyrics,
             rhythmIntensity = settings.rhythmIntensity,
             coverShape = settings.coverShape,
@@ -589,6 +638,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             cacheLimitMb = settings.cacheLimitMb.takeIf { it > 0 } ?: app.defaultCacheLimitMb(),
             reduceMotion = settings.reduceMotion,
             volumeNormalization = settings.volumeNormalization,
+            audioQuality = settings.audioQuality,
             showBottomNav = settings.showBottomNav,
             cookies = settings.cookies,
             sodaSignerUrl = settings.sodaSignerUrl,
@@ -606,12 +656,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         settings = { settingsState.value.aggregation },
         splitOverrides = { splitOverrideKeys },
         mergeOverrides = { mergeTargets },
+        // music.op.wiki 一次搜索要等 MHub 去各上游平台检索，冷缓存单平台就可能 5 秒
+        timeoutOverridesMs = mapOf("mhub" to 15_000),
     )
     private val resolver = SourceResolver(
         repository = app.repository,
         cookies = { settingsState.value.cookies },
         settings = { settingsState.value.aggregation },
         workDir = { app.cacheDir },
+        quality = { AudioQuality.normalize(settingsState.value.audioQuality) ?: AudioQuality.Auto },
     )
     private val matchJob = MatchJob(
         repository = app.repository,
@@ -643,6 +696,39 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             runCatching { app.settings.state.first() }
             AppleLyricsConfig.configure(settingsState.value.thirdPartyLyrics)
             _settingsReady.value = true
+        }
+        startLyricon()
+        viewModelScope.launch {
+            app.settings.state.first()
+            LxSources.records.collect { records ->
+                if (records.none { it.enabled }) return@collect
+                val current = settingsState.value.aggregation
+                // providerPriority 里保留过 lx 表示用户已经做过选择，尤其不能在手动关闭后反复自动打开。
+                if (LxPlatform.PROVIDER_ID !in current.enabledProviders && LxPlatform.PROVIDER_ID !in current.providerPriority) {
+                    app.settings.saveAggregation(
+                        current.copy(
+                            enabledProviders = current.enabledProviders + LxPlatform.PROVIDER_ID,
+                            providerPriority = current.providerPriority + LxPlatform.PROVIDER_ID,
+                        ),
+                    )
+                }
+            }
+        }
+        viewModelScope.launch {
+            // 首次冷启动后台补齐内置洛雪音源：至少导入一个或本就无缺失即记为完成，
+            // 全部失败（如离线）不置位，下次冷启动重试；缺的可在设置的内置页签手动补。
+            if (!app.settings.state.first().lxBuiltinImported) {
+                val summary = try {
+                    LxSources.importBuiltinAll()
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    null
+                }
+                if (summary != null && (summary.imported > 0 || summary.failed == 0)) {
+                    app.settings.lxBuiltinImported(true)
+                }
+            }
         }
         viewModelScope.launch {
             // 冷启动先把上次存下来的账号资料铺上：等各平台用户信息接口返回之前，
@@ -721,11 +807,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             uiLaunched.first { it }
             checkUpdatesInBackground()
         }
-        // 后台下载只收起进度；完成时应用在前台就自动打开安装器，否则回到应用时再打开。
+        // 后台下载只收起进度；完成时应用在前台就自动打开安装器；后台播放的也把应用带回
+        // 前台（路由到「关于与更新」），回到前台后 onAppForeground 的 Ready 分支接着拉安装器。
         viewModelScope.launch {
             updateState.map { it.phase }.distinctUntilChanged().collect { phase ->
-                if (phase == UpdatePhase.Ready && ForegroundActivity.get() != null) {
+                if (phase != UpdatePhase.Ready) return@collect
+                if (ForegroundActivity.get() != null) {
                     launchUpdateInstaller()
+                } else {
+                    // 后台启动 Activity 受系统限制，被 ROM 拦下时还有下载完成的通知兜底（点击回应用）
+                    runCatching { app.startActivity(WidgetLinks.intent(app, WidgetTarget.Updates)) }
                 }
             }
         }
@@ -1216,43 +1307,205 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     // ---------- collection detail ----------
 
+    /**
+     * 详情页按返回栈分开存（key 见 [collectionKey]）：歌手 → 专辑 → 另一个歌手 → 专辑这样一路点下去，
+     * 返回时每一层还是自己的内容。[_collection] 是当前在前台的那一页，播放全部 / 收藏 / 加入队列都对它操作；
+     * 页面回到前台时由路由调 [activateCollection] 切回来。
+     */
+    private val _collectionPages = MutableStateFlow<Map<String, CollectionUiState>>(emptyMap())
+    val collectionPages: StateFlow<Map<String, CollectionUiState>> = _collectionPages
+    private val collectionJobs = HashMap<String, Job>()
+
+    /** 新开一页详情：放进缓存、设为当前页、通知界面跳转。 */
+    private fun showCollection(state: CollectionUiState) {
+        _collectionPages.update { pages ->
+            val next = LinkedHashMap(pages)
+            next.remove(state.key)
+            next[state.key] = state
+            while (next.size > MAX_COLLECTION_PAGES) next.remove(next.keys.first())
+            next
+        }
+        _collection.value = state
+        _events.tryEmit(UiEvent.OpenCollection(state.title, state.key))
+    }
+
+    /** 改某一页；它正好在前台时同步到 [_collection]。页面已被挤出缓存就丢掉这次结果。 */
+    private fun updateCollection(key: String, transform: (CollectionUiState) -> CollectionUiState) {
+        var updated: CollectionUiState? = null
+        _collectionPages.update { pages ->
+            val current = pages[key] ?: return@update pages
+            val next = transform(current)
+            updated = next
+            pages + (key to next)
+        }
+        val next = updated ?: return
+        if (_collection.value.key == key) _collection.value = next
+    }
+
+    /**
+     * 详情页回到前台（进入、或从上一层返回）：把它设为当前页。进程被回收后从返回栈恢复时缓存是空的，
+     * 按 key 里的类型、平台和 id 重新加载（标题等加载回来再补）。
+     */
+    fun activateCollection(key: String) {
+        val cached = _collectionPages.value[key]
+        if (cached != null) {
+            if (_collection.value.key != key) _collection.value = cached
+            return
+        }
+        val parsed = parseCollectionKey(key)
+        if (parsed == null) {
+            // 按名字找的专辑（`Album|平台|name:专辑名`）：没有平台 id，按名字重新找一次
+            val parts = key.split('|', limit = 3)
+            if (parts.size != 3 || parts[0] != CollectionKind.Album.name || !parts[2].startsWith("name:")) return
+            val state = CollectionUiState(
+                key = key,
+                kind = CollectionKind.Album,
+                title = parts[2].removePrefix("name:"),
+                source = parts[1],
+                sourceName = providerName(parts[1]),
+                loading = true,
+            )
+            _collectionPages.update { it + (key to state) }
+            _collection.value = state
+            resolveAlbumByName(key)
+            return
+        }
+        val (kind, source, id) = parsed
+        val state = CollectionUiState(key = key, kind = kind, id = id, source = source, sourceName = providerName(source), loading = true)
+        _collectionPages.update { it + (key to state) }
+        _collection.value = state
+        loadCollection(key)
+    }
+
     fun openChart(chart: TopList) {
         val source = chart.source.ifBlank { _charts.value.providerId.ifBlank { settingsState.value.provider } }
         val subtitle = listOf(
             chart.updateFrequency.ifBlank { chart.description },
             "${chart.trackCount} 首".takeIf { chart.trackCount > 0 },
         ).filterNotNull().filter { it.isNotBlank() }.joinToString(" / ")
-        _collection.value = CollectionUiState(
-            kind = CollectionKind.Chart,
-            id = chart.id,
-            title = chart.name,
-            subtitle = subtitle,
-            cover = chart.cover,
-            source = source,
-            sourceName = providerName(source),
-            loading = true,
+        val key = collectionKey(CollectionKind.Chart, source, chart.id)
+        showCollection(
+            CollectionUiState(
+                key = key,
+                kind = CollectionKind.Chart,
+                id = chart.id,
+                title = chart.name,
+                subtitle = subtitle,
+                cover = chart.cover,
+                source = source,
+                sourceName = providerName(source),
+                loading = true,
+            ),
         )
-        _events.tryEmit(UiEvent.OpenCollection(chart.name))
-        val generation = ++collectionGeneration
-        viewModelScope.launch {
-            val result = runCatching { app.repository.topListSongs(source, cookieFor(source), chart.id) }
-            if (generation != collectionGeneration) return@launch
-            _collection.update {
-                it.copy(
-                    songs = result.getOrDefault(emptyList()),
-                    loading = false,
-                    error = result.exceptionOrNull()?.message.orEmpty(),
-                )
-            }
-        }
+        loadCollection(key)
     }
 
     fun openPlaylist(playlist: Playlist, album: Boolean) {
         openCollection(playlist, if (album) CollectionKind.Album else CollectionKind.Playlist)
     }
 
+    /** 歌手页的专辑卡片、专辑页底部的“更多专辑”。没有 id（从歌曲归并出来的）就按名字在平台上找。 */
+    fun openAlbum(album: AlbumSummary) {
+        if (album.id.isNotBlank()) {
+            openCollection(album.toPlaylist(), CollectionKind.Album)
+        } else {
+            openAlbumByName(album.name, album.artist, album.source, album.cover)
+        }
+    }
+
+    /** 搜索结果里的歌手：打开歌手页（资料 + 热门歌曲 + 专辑 + 简介）。 */
     fun openArtist(playlist: Playlist) {
-        openCollection(playlist, CollectionKind.Artist)
+        val key = artistPages.open(playlist, settingsState.value.provider)
+        _events.tryEmit(UiEvent.OpenArtist(key))
+    }
+
+    /**
+     * 歌曲上的歌手名 → 歌手页：在歌曲所在平台按名字找这个歌手，平台查不了歌手就用浏览来源 / 第一个能查的平台。
+     * 从播放页、海报墙进来时先把它们收起来，露出导航里的歌手页。
+     */
+    fun openArtistByName(name: String, song: Song? = null) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return
+        val key = artistPages.openByName(trimmed, song?.source.orEmpty())
+        base.value = base.value.copy(playerOpen = false, posterOpen = false)
+        _events.tryEmit(UiEvent.OpenArtist(key))
+    }
+
+    /** 歌曲 → 它所在的专辑。歌曲带了专辑 id 且平台能读专辑就直接开；否则按专辑名 + 歌手在平台上找。 */
+    fun openAlbumOf(song: Song) {
+        if (song.album.isBlank()) return
+        base.value = base.value.copy(playerOpen = false, posterOpen = false)
+        val id = albumIdOf(song)
+        val provider = base.value.providers.find { it.id == song.source }
+        if (id.isNotBlank() && provider?.albumSongs == true) {
+            openCollection(
+                Playlist(id = id, name = song.album, cover = song.cover, creator = song.artist, source = song.source),
+                CollectionKind.Album,
+            )
+        } else {
+            openAlbumByName(song.album, song.artist, song.source, song.cover)
+        }
+    }
+
+    /** 按专辑名 + 歌手搜专辑：页面先开出来（名字、封面），找到后再读曲目。 */
+    private fun openAlbumByName(name: String, artist: String, preferSource: String, cover: String) {
+        val candidates = albumSearchProviders()
+        val source = candidates.firstOrNull { it.id == preferSource }?.id ?: candidates.firstOrNull()?.id
+        if (source == null) {
+            message("没有可以查专辑的平台", error = true)
+            return
+        }
+        val key = collectionKey(CollectionKind.Album, source, "name:$name")
+        showCollection(
+            CollectionUiState(
+                key = key,
+                kind = CollectionKind.Album,
+                id = "",
+                title = name,
+                subtitle = artist,
+                cover = cover,
+                source = source,
+                sourceName = providerName(source),
+                loading = true,
+            ),
+        )
+        resolveAlbumByName(key)
+    }
+
+    /** 按页面里记的专辑名（title）、歌手（subtitle）在它的平台上搜这张专辑，找到后补上 id 再读曲目。 */
+    private fun resolveAlbumByName(key: String) {
+        val page = _collectionPages.value[key] ?: return
+        val name = page.title
+        val artist = page.subtitle
+        val source = page.source
+        val cover = page.cover
+        updateCollection(key) { it.copy(loading = true, error = "") }
+        collectionJobs[key]?.cancel()
+        collectionJobs[key] = viewModelScope.launch {
+            val keyword = listOf(name, splitArtistNames(artist).firstOrNull().orEmpty()).filter { it.isNotBlank() }.joinToString(" ")
+            val found = runCatching { app.repository.searchAlbums(source, cookieFor(source), keyword) }
+                .getOrElse {
+                    if (it is CancellationException) throw it
+                    emptyList()
+                }
+                .let { pickAlbum(name, artist, it) }
+            if (found == null) {
+                updateCollection(key) {
+                    it.copy(loading = false, error = "没有在${providerName(source)}找到专辑“$name”")
+                }
+                return@launch
+            }
+            updateCollection(key) {
+                it.copy(
+                    id = found.id,
+                    title = found.name.ifBlank { name },
+                    cover = found.cover.ifBlank { cover },
+                    subtitle = found.creator.ifBlank { artist },
+                    album = found.toAlbumSummary().takeIf { album -> album.hasHeaderInfo() },
+                )
+            }
+            loadCollection(key)
+        }
     }
 
     private fun openCollection(playlist: Playlist, kind: CollectionKind) {
@@ -1267,28 +1520,62 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             playlist.creator.ifBlank { fallback },
             "${playlist.trackCount} 首".takeIf { playlist.trackCount > 0 } ?: "",
         ).filter { it.isNotBlank() }.joinToString(" / ")
-        _collection.value = CollectionUiState(
-            kind = kind,
-            id = playlist.id,
-            title = playlist.name,
-            subtitle = subtitle,
-            cover = playlist.cover,
-            source = source,
-            sourceName = providerName(source),
-            loading = true,
+        val key = collectionKey(kind, source, playlist.id)
+        // 搜索结果 / 歌手专辑列表里已经带了发行时间、厂牌等，专辑详情回来之前头部先用它们
+        val seedAlbum = if (kind == CollectionKind.Album) playlist.toAlbumSummary().takeIf { it.hasHeaderInfo() } else null
+        showCollection(
+            CollectionUiState(
+                key = key,
+                kind = kind,
+                id = playlist.id,
+                title = playlist.name,
+                subtitle = subtitle,
+                cover = playlist.cover,
+                source = source,
+                sourceName = providerName(source),
+                loading = true,
+                album = seedAlbum,
+            ),
         )
-        _events.tryEmit(UiEvent.OpenCollection(playlist.name))
-        val generation = ++collectionGeneration
-        viewModelScope.launch {
+        loadCollection(key)
+    }
+
+    /** 按页面里记的类型读曲目；专辑另外读头部资料和同一歌手的其他专辑。 */
+    private fun loadCollection(key: String) {
+        val current = _collectionPages.value[key] ?: return
+        if (current.id.isBlank()) return
+        collectionJobs[key]?.cancel()
+        updateCollection(key) { it.copy(loading = true, error = "") }
+        val source = current.source
+        val cookie = cookieFor(source)
+        collectionJobs[key] = viewModelScope.launch {
+            if (current.kind == CollectionKind.Album) {
+                val result = runCatching { app.repository.albumDetail(source, cookie, current.id) }
+                result.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+                val detail = result.getOrNull()
+                updateCollection(key) { state ->
+                    val album = detail?.album?.let { mergeAlbumHeader(state.album, it) } ?: state.album
+                    state.copy(
+                        songs = detail?.songs.orEmpty(),
+                        loading = false,
+                        error = result.exceptionOrNull()?.message.orEmpty(),
+                        title = state.title.ifBlank { album?.name.orEmpty() },
+                        cover = state.cover.ifBlank { album?.cover.orEmpty() },
+                        album = album,
+                    )
+                }
+                if (detail != null) loadMoreAlbums(key)
+                return@launch
+            }
             val result = runCatching {
-                when (kind) {
-                    CollectionKind.Album -> app.repository.albumSongs(source, cookieFor(source), playlist.id)
-                    CollectionKind.Artist -> app.repository.artistSongs(source, cookieFor(source), playlist.id)
-                    else -> app.repository.playlistSongs(source, cookieFor(source), playlist.id)
+                when (current.kind) {
+                    CollectionKind.Chart -> app.repository.topListSongs(source, cookie, current.id)
+                    CollectionKind.Artist -> app.repository.artistSongs(source, cookie, current.id)
+                    else -> app.repository.playlistSongs(source, cookie, current.id)
                 }
             }
-            if (generation != collectionGeneration) return@launch
-            _collection.update {
+            result.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+            updateCollection(key) {
                 it.copy(
                     songs = result.getOrDefault(emptyList()),
                     loading = false,
@@ -1296,34 +1583,114 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         }
+    }
+
+    /** 专辑页底部“更多专辑”：主歌手的其他专辑。没有歌手 id 时按歌手名在同一平台上找一次。 */
+    private suspend fun loadMoreAlbums(key: String) {
+        val state = _collectionPages.value[key] ?: return
+        val source = state.source
+        val cookie = cookieFor(source)
+        val artistName = splitArtistNames(
+            state.album?.artist.orEmpty().ifBlank { state.songs.firstOrNull()?.artist.orEmpty() },
+        ).firstOrNull().orEmpty()
+        val provider = base.value.providers.find { it.id == source }
+        val artistId = state.album?.artistId?.takeIf { it.isNotBlank() }
+            ?: if (artistName.isNotBlank() && provider?.searchArtist == true) {
+                runCatching { pickArtist(artistName, app.repository.searchArtists(source, cookie, artistName)) }
+                    .getOrElse {
+                        if (it is CancellationException) throw it
+                        null
+                    }
+                    ?.id
+            } else {
+                null
+            }
+        if (artistId.isNullOrBlank()) return
+        val page = runCatching { app.repository.artistAlbums(source, cookie, artistId, 1, 20) }.getOrElse {
+            if (it is CancellationException) throw it
+            return
+        }
+        val titleKey = TrackNormalizer.keyOf(state.title)
+        val others = page.albums.filter { it.id != state.id && TrackNormalizer.keyOf(it.name) != titleKey }
+        updateCollection(key) {
+            it.copy(
+                moreAlbums = others,
+                album = (it.album ?: AlbumSummary(id = it.id, name = it.title, source = source, artist = artistName))
+                    .copy(artistId = artistId),
+            )
+        }
+    }
+
+    /** 能按名字搜专辑并读专辑曲目的平台，浏览来源在前。 */
+    private fun albumSearchProviders(): List<ProviderInfo> {
+        val browse = settingsState.value.provider
+        return enabledProviders().filter { it.searchAlbum && it.albumSongs }.sortedByDescending { it.id == browse }
+    }
+
+    /** 能按名字搜歌手的平台，浏览来源在前；歌手页从歌曲进来时按这个顺序挑平台。 */
+    private fun artistSearchProviders(): List<ProviderInfo> {
+        val browse = settingsState.value.provider
+        return enabledProviders().filter { it.searchArtist }.sortedByDescending { it.id == browse }
     }
 
     fun retryCollection() {
         val current = _collection.value
-        if (current.title.isBlank()) return
-        val generation = ++collectionGeneration
-        _collection.update { it.copy(loading = true, error = "") }
-        viewModelScope.launch {
-            val result = runCatching {
-                when (current.kind) {
-                    CollectionKind.Chart -> app.repository.topListSongs(current.source, cookieFor(current.source), current.id)
-                    CollectionKind.Album -> app.repository.albumSongs(current.source, cookieFor(current.source), current.id)
-                    CollectionKind.Artist -> app.repository.artistSongs(current.source, cookieFor(current.source), current.id)
-                    CollectionKind.Playlist -> app.repository.playlistSongs(current.source, cookieFor(current.source), current.id)
-                }
-            }
-            if (generation != collectionGeneration) return@launch
-            _collection.update {
-                it.copy(
-                    songs = result.getOrDefault(emptyList()),
-                    loading = false,
-                    error = result.exceptionOrNull()?.message.orEmpty(),
-                )
-            }
+        if (current.key.isBlank()) return
+        if (current.id.isBlank() && current.kind == CollectionKind.Album) {
+            resolveAlbumByName(current.key)
+            return
         }
+        loadCollection(current.key)
     }
 
-    /** [openPlayer] 为 false 时不弹出播放页（详情页海报视图：开始播放的那首在墙上长成大卡）。 */
+    // ---------- artist page ----------
+
+    private val artistPages by lazy {
+        ArtistPages(
+            scope = viewModelScope,
+            repository = app.repository,
+            cookieFor = ::cookieFor,
+            providerName = ::providerName,
+            artistProviders = ::artistSearchProviders,
+        )
+    }
+    val artistPagesState: StateFlow<Map<String, ArtistUiState>> get() = artistPages.pages
+
+    fun ensureArtist(key: String) = artistPages.ensure(key)
+    fun retryArtist(key: String) = artistPages.retry(key)
+    fun loadMoreArtistAlbums(key: String) = artistPages.loadMoreAlbums(key)
+
+    /** 歌手页的“播放热门 / 随机播放”。 */
+    fun playArtist(key: String, shuffle: Boolean = false) {
+        val songs = artistPages.pages.value[key]?.visibleSongs.orEmpty()
+        if (songs.isEmpty()) {
+            message("歌手的歌还没有加载完成")
+            return
+        }
+        val queue = if (shuffle) songs.shuffled() else songs
+        play(queue.first(), queue)
+    }
+
+    /** 歌手页的歌接到播放队列末尾。 */
+    fun queueArtist(key: String) {
+        val songs = artistPages.pages.value[key]?.visibleSongs.orEmpty()
+        if (songs.isEmpty()) {
+            message("歌手的歌还没有加载完成")
+            return
+        }
+        enqueueSongs(songs)
+    }
+
+    /** 把歌手的热门歌曲存成一张本地歌单（以歌手名命名）。 */
+    fun saveArtistSongs(key: String) {
+        val state = artistPages.pages.value[key] ?: return
+        val songs = state.visibleSongs
+        if (songs.isEmpty()) {
+            message("歌手的歌还没有加载完成")
+            return
+        }
+        addSongsToLibrary(state.displayName, songs)
+    }
     fun playCollection(openPlayer: Boolean = true) {
         val songs = _collection.value.songs
         if (songs.isNotEmpty()) play(songs.first(), songs, openPlayer)
@@ -1461,6 +1828,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             message("当前歌单还没有加载完成")
             return
         }
+        enqueueSongs(songs)
+    }
+
+    /** 一批歌接到播放队列末尾；队列为空时直接播放。已在队列里的不重复添加。 */
+    private fun enqueueSongs(songs: List<Song>) {
         val player = controller
         if (player == null || base.value.queue.isEmpty()) {
             play(songs.first(), songs)
@@ -1907,53 +2279,138 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             base.value = base.value.copy(loading = true, error = "")
             try {
-                for (providerId in linkParseCandidates(value)) {
-                    val cookie = cookieFor(providerId)
-                    val playlist = runCatching { app.repository.parsePlaylist(providerId, cookie, value) }.getOrNull()
-                    val album = if (playlist == null) {
-                        runCatching { app.repository.parseAlbum(providerId, cookie, value) }.getOrNull()
-                    } else {
-                        null
-                    }
-                    val result = playlist ?: album
-                    if (result != null) {
-                        val kind = if (playlist != null) CollectionKind.Playlist else CollectionKind.Album
-                        val source = result.item.source.ifBlank { providerId }
-                        _collection.value = CollectionUiState(
-                            kind = kind,
-                            id = result.item.id,
-                            title = result.item.name,
-                            subtitle = listOf(result.item.creator, "${result.songs.size} 首").filter { it.isNotBlank() }.joinToString(" / "),
-                            cover = result.item.cover,
-                            source = source,
-                            sourceName = providerName(source),
-                            songs = result.songs,
-                        )
-                        _events.tryEmit(UiEvent.OpenCollection(result.item.name))
-                        // 复制歌单链接导入 = 直接绑定为跟随平台更新的本地歌单
-                        if (kind == CollectionKind.Playlist) {
-                            bindPlatformPlaylist(
-                                name = result.item.name,
-                                provider = source,
-                                remoteId = result.item.id,
-                                cover = result.item.cover,
-                                songs = result.songs,
-                            )
-                        }
-                        return@launch
-                    }
-                    val song = runCatching { app.repository.parseSong(providerId, cookie, value) }.getOrNull()
-                    if (song != null) {
-                        play(song, listOf(song))
-                        return@launch
-                    }
+                when (val target = parseLinkTarget(value, linkParseCandidates(value))) {
+                    is LinkTarget.Collection -> showParsedCollection(target.providerId, target.kind, target.result)
+                    is LinkTarget.Track -> play(target.song, listOf(target.song))
+                    null -> base.value = base.value.copy(error = "没有识别到这个链接")
                 }
-                base.value = base.value.copy(error = "没有识别到这个链接")
             } finally {
                 base.value = base.value.copy(loading = false)
             }
         }
     }
+
+    /** openLink / 导入入口的解析结果：歌单或专辑合集（带解析用的平台 id），或单曲。 */
+    private sealed interface LinkTarget {
+        data class Collection(val providerId: String, val kind: CollectionKind, val result: CollectionResult) : LinkTarget
+        data class Track(val song: Song) : LinkTarget
+    }
+
+    /**
+     * 链接 / ID 解析核心：按候选平台依次尝试歌单 → 专辑 → 单曲，单个平台失败换下一个。
+     * 全部失败返回 null，由调用方决定提示语。
+     */
+    private suspend fun parseLinkTarget(text: String, candidates: List<String>): LinkTarget? {
+        for (providerId in candidates) {
+            val cookie = cookieFor(providerId)
+            val playlist = runCatching { app.repository.parsePlaylist(providerId, cookie, text) }.getOrNull()
+            val album = if (playlist == null) {
+                runCatching { app.repository.parseAlbum(providerId, cookie, text) }.getOrNull()
+            } else {
+                null
+            }
+            val result = playlist ?: album
+            if (result != null) {
+                val kind = if (playlist != null) CollectionKind.Playlist else CollectionKind.Album
+                return LinkTarget.Collection(providerId, kind, result)
+            }
+            val song = runCatching { app.repository.parseSong(providerId, cookie, text) }.getOrNull()
+            if (song != null) return LinkTarget.Track(song)
+        }
+        return null
+    }
+
+    /** 解析成功后的展示：填合集详情并打开；歌单直接绑定为跟随平台更新的本地歌单。 */
+    private fun showParsedCollection(providerId: String, kind: CollectionKind, result: CollectionResult) {
+        val source = result.item.source.ifBlank { providerId }
+        val key = collectionKey(kind, source, result.item.id)
+        showCollection(
+            CollectionUiState(
+                key = key,
+                kind = kind,
+                id = result.item.id,
+                title = result.item.name,
+                subtitle = listOf(result.item.creator, "${result.songs.size} 首").filter { it.isNotBlank() }.joinToString(" / "),
+                cover = result.item.cover,
+                source = source,
+                sourceName = providerName(source),
+                songs = result.songs,
+                album = if (kind == CollectionKind.Album) result.item.toAlbumSummary().takeIf { it.hasHeaderInfo() } else null,
+            ),
+        )
+        if (kind == CollectionKind.Album) viewModelScope.launch { loadMoreAlbums(key) }
+        // 复制歌单链接 / 输入歌单 ID 导入 = 直接绑定为跟随平台更新的本地歌单
+        if (kind == CollectionKind.Playlist) {
+            bindPlatformPlaylist(
+                name = result.item.name,
+                provider = source,
+                remoteId = result.item.id,
+                cover = result.item.cover,
+                songs = result.songs,
+            )
+        }
+    }
+
+    /**
+     * 显式导入歌单入口：粘贴分享链接按域名定平台；直接输入的歌单 ID（非链接、无空白）
+     * 由界面选好平台后传入。歌单/专辑打开详情并绑定，单曲链接给出提示。
+     */
+    fun importPlaylist(text: String, providerId: String?) {
+        val value = text.trim()
+        if (value.isBlank()) return
+        viewModelScope.launch {
+            base.value = base.value.copy(loading = true, error = "")
+            try {
+                val candidates = providerId?.takeIf { it.isNotBlank() }?.let(::listOf) ?: linkParseCandidates(value)
+                when (val target = parseLinkTarget(value, candidates)) {
+                    is LinkTarget.Collection -> showParsedCollection(target.providerId, target.kind, target.result)
+                    is LinkTarget.Track -> base.value = base.value.copy(error = "这是单曲链接，请粘贴歌单或专辑内容")
+                    null -> base.value = base.value.copy(
+                        error = if (providerId != null) "这个平台没有找到对应歌单" else "没有识别到这个链接",
+                    )
+                }
+            } finally {
+                base.value = base.value.copy(loading = false)
+            }
+        }
+    }
+
+    /** 手机远控网页的导入歌单：解析成功即打开详情并绑定，结果回给网页提示。 */
+    internal suspend fun importForRemote(text: String, providerId: String?): RemoteImportResult {
+        settingsReady.first { it }
+        val value = text.trim()
+        if (value.isEmpty()) return RemoteImportResult(success = false, message = "导入内容不能为空")
+        val candidates = providerId?.takeIf { it.isNotBlank() }?.let(::listOf) ?: linkParseCandidates(value)
+        return when (val target = parseLinkTarget(value, candidates)) {
+            is LinkTarget.Collection -> {
+                showParsedCollection(target.providerId, target.kind, target.result)
+                val noun = if (target.kind == CollectionKind.Playlist) "歌单" else "专辑"
+                RemoteImportResult(
+                    success = true,
+                    title = target.result.item.name,
+                    count = target.result.songs.size,
+                    message = "已导入$noun「${target.result.item.name}」",
+                )
+            }
+            is LinkTarget.Track -> RemoteImportResult(success = false, message = "这是单曲链接，请粘贴歌单链接或输入歌单 ID")
+            null -> RemoteImportResult(
+                success = false,
+                message = if (providerId != null) "这个平台没有找到对应歌单" else "没有识别到这个链接或 ID",
+            )
+        }
+    }
+
+    /** 远控网页导入结果：success + 歌单名/歌曲数给手机端 toast。 */
+    internal data class RemoteImportResult(
+        val success: Boolean,
+        val title: String = "",
+        val count: Int = 0,
+        val message: String = "",
+    )
+
+    /** 远控网页导入歌单的平台列表（能解析歌单的平台），裸 ID 时给手机端选。 */
+    internal fun providersForRemoteImport(): List<Pair<String, String>> =
+        base.value.providers.filter { it.parsePlaylist }.map { it.id to it.name }
 
     // 链接属于哪个平台由域名决定，不跟默认平台走；识别不出或解析失败时，按默认平台、其余可解析平台兜底
     private fun linkParseCandidates(link: String): List<String> {
@@ -3187,6 +3644,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
         currentCoroutineContext().ensureActive()
         dormant = null
+        resolvedSources.clear()
+        resolvedSources[playableTrack.id] = source
         AppLog.d(
             "Player",
             "起播《${resolvedSong.title}》${source.providerName}${if (resolved.fromLocal) "（本机文件）" else ""}" +
@@ -3296,6 +3755,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val queue = base.value.sourcePickerQueue.ifEmpty { listOf(track) }
         viewModelScope.launch {
             base.value = base.value.copy(sourcePickerBusy = providerId, sourcePickerError = "", sourcePickerInfo = "")
+            if (providerId == LxPlatform.PROVIDER_ID) {
+                if (remember) {
+                    app.settings.saveAggregation(
+                        settingsState.value.aggregation.copy(
+                            playbackMode = PlaybackMode.Pinned,
+                            pinnedProvider = providerId,
+                        ),
+                    )
+                }
+                pinnedProviders[track.id] = providerId
+                base.value = base.value.copy(sourcePickerTrack = null, sourcePickerQueue = emptyList(), sourcePickerBusy = "")
+                playTrack(track, queue, providerId)
+                return@launch
+            }
             val existing = track.sources.find { it.providerId == providerId }
             val source = if (existing != null) {
                 existing
@@ -3545,7 +4018,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 _recognition.value = recognitionError(error.message ?: "录音失败")
                 return@launch
             } finally {
-                if (wasPlaying) controller?.play()
+                if (wasPlaying) {
+                    // 识曲录完把音乐接回去不算新起播，别因此把人拉进歌词页
+                    autoLyricsSuppressUntil = SystemClock.elapsedRealtime() + AUTO_LYRICS_SUPPRESS_MS
+                    controller?.play()
+                }
             }
             if (!isActive) return@launch
 
@@ -3751,6 +4228,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearQueue() {
         dormant = null
+        resolvedSources.clear()
         controller?.clearMediaItems()
         controller?.stop()
         _position.value = 0
@@ -3765,6 +4243,36 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             getApplication<Application>().startActivity(intent)
         }
         base.value = base.value.copy(deepLink = "")
+    }
+
+    private fun startLyricon() {
+        viewModelScope.launch {
+            // 等本机真实设置落下一帧再注册，不能把用户已关闭的互通短暂打开。
+            _settingsReady.first { it }
+            combine(base, settingsState) { ui, settings ->
+                val song = ui.current
+                LyriconTrackInput(
+                    song = song,
+                    durationMs = ui.duration,
+                    lyricsRaw = ui.lyrics,
+                    lyricsReady = song != null && ui.lyricsKey == song.key,
+                    lyricText = settings.lyricText,
+                    subline = settings.lyricStage.subline,
+                    playing = ui.playing,
+                    providerEnabled = settings.lyriconProviderEnabled,
+                    subscriberEnabled = settings.lyriconSubscriberEnabled,
+                )
+            }.distinctUntilChanged().collectLatest { input ->
+                // 简繁、拆双语和罗马音都走现有管线；快速切歌时取消上一首的转换。
+                val update = withContext(Dispatchers.Default) { LyriconMapper.prepare(input) }
+                lyricon.update(update)
+            }
+        }
+        viewModelScope.launch {
+            _settingsReady.first { it }
+            // 直接复用 UI 的 100ms 本地时钟，不读取 MediaSession 最长三秒才推送的快照。
+            position.collect(lyricon::updatePosition)
+        }
     }
 
     private var lyricsJob: Job? = null
@@ -4074,6 +4582,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             "soda" -> "汽水音乐"
             "bilibili" -> "Bilibili"
             "local" -> "本地"
+            LxPlatform.PROVIDER_ID -> LxPlatform.PROVIDER_NAME
             else -> id
         }
 
@@ -4222,6 +4731,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 interruptedBySystem = false
                 // 用户自己按的播放：断流重连的次数重新算
                 liveRetryCount = 0
+                // 暂停→播放（方向盘、语音、耳机这些外部控制也一样）在主界面上时直接进歌词页
+                if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST) maybeAutoLyricsView()
                 return
             }
             // 离开应用时的自动暂停：账在 onAppBackgrounded 里已经记了，别当成用户按的暂停清掉
@@ -4231,6 +4742,19 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             }
             interruptedBySystem = reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS ||
                 reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY
+            // 车机的音频策略会在安装器盖上时抢走焦点：安装窗口里把播放接回去（拔耳机那种
+            // BECOMING_NOISY 不接，保持安全默认），装完或取消安装回到应用，音乐一直没停
+            if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS &&
+                SystemClock.elapsedRealtime() < installKeepPlayingUntil
+            ) {
+                viewModelScope.launch {
+                    delay(INSTALL_KEEP_PLAYING_RESUME_MS)
+                    val player = controller ?: return@launch
+                    if (!player.playWhenReady && player.mediaItemCount > 0 && player.playbackState != Player.STATE_ENDED) {
+                        player.play()
+                    }
+                }
+            }
         }
 
         override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
@@ -4256,7 +4780,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val index = controller?.currentMediaItemIndex ?: return
             val song = base.value.queue.getOrNull(index) ?: return
             val track = base.value.canonicalQueue.getOrNull(index)
-            val source = track?.sources?.find { it.song.key == song.key }
+            val source = track?.let { resolvedSources[it.id] } ?: track?.sources?.find { it.song.key == song.key }
             base.value = base.value.copy(currentTrack = track, currentSource = source)
             staleErrorRetried = -1
             extendFeedIfNeeded(index)
@@ -4515,6 +5039,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     if (pinnedProviders[track.id] == failedSource?.providerId) {
                         pinnedProviders[track.id] = resolution.source.providerId
                     }
+                    resolvedSources[result.track.id] = resolution.source
                     base.value = base.value.copy(
                         queue = base.value.queue.mapIndexed { i, queued -> if (i == at) resolved else queued },
                         canonicalQueue = base.value.canonicalQueue.mapIndexed { i, queued -> if (i == at) result.track else queued },
@@ -5145,6 +5670,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             if (player.playWhenReady) return@launch
             // interruptedBySystem 记着最近一次暂停是谁按的：只有被系统打断的回来才接
             if (respectUserPause && !interruptedBySystem) return@launch
+            // 自动接续不算用户起播，别让它触发「主界面起播进歌词页」
+            autoLyricsSuppressUntil = SystemClock.elapsedRealtime() + AUTO_LYRICS_SUPPRESS_MS
             if (dormant != null && player.mediaItemCount == 0) {
                 launchResume()
             } else if (player.mediaItemCount > 0) {
@@ -5171,6 +5698,23 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun consumeLyricsView() {
         _lyricsView.value = false
+    }
+
+    /**
+     * 起播要进歌词页时先过这道闸：界面没起、应用自发的接续（[autoLyricsSuppressUntil]）、
+     * 播放页或海报墙已经盖在主界面上（应用内点歌本来就会开播放页）、没歌在放、设置关了都不算。
+     * 外部点歌链路（远控网页的搜索结果点播）也调它补发信号。
+     */
+    internal fun maybeAutoLyricsView() {
+        if (!uiLaunched.value || SystemClock.elapsedRealtime() < autoLyricsSuppressUntil) return
+        val ui = base.value
+        if (ui.playerOpen || ui.posterOpen || ui.current == null) return
+        if (!settingsState.value.autoLyricsIdle) return
+        _autoLyrics.value = true
+    }
+
+    fun consumeAutoLyrics() {
+        _autoLyrics.value = false
     }
 
     fun requestSearch(request: SearchRequest) {
@@ -5255,7 +5799,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             playRequestNext(track, pinned, requestId)
         }
         if (!started) error(base.value.playbackNotice.ifBlank { base.value.error.ifBlank { "暂时放不了这首" } })
-        return awaitPlaybackStart()
+        val playing = awaitPlaybackStart()
+        // 外部点歌（远控 / MCP / 广播）是明确的「我要听这首」：播放中插播没有暂停→播放的
+        // 边沿，起播信号收不到，这里补发一次，主界面上直接进歌词页
+        if (playing) maybeAutoLyricsView()
+        return playing
     }
 
     private data class RequestedCollection(
@@ -5603,8 +6151,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun setReduceMotion(value: Boolean) = viewModelScope.launch { app.settings.reduceMotion(value) }
     fun setVolumeNormalization(value: Boolean) =
         viewModelScope.launch { app.settings.volumeNormalization(value) }
+    fun setAudioQuality(value: AudioQuality) =
+        viewModelScope.launch { app.settings.audioQuality(value.id) }
     fun setLyricsBackground(value: LyricsBackgroundMode) = viewModelScope.launch { app.settings.lyricsBackground(value) }
     fun setNotificationLyrics(value: Boolean) = viewModelScope.launch { app.settings.notificationLyrics(value) }
+    fun setLyriconProviderEnabled(value: Boolean) = viewModelScope.launch { app.settings.lyriconProviderEnabled(value) }
+    fun setLyriconSubscriberEnabled(value: Boolean) = viewModelScope.launch { app.settings.lyriconSubscriberEnabled(value) }
     fun setRhythmIntensity(value: RhythmIntensity) = viewModelScope.launch { app.settings.rhythmIntensity(value) }
     fun setCoverShape(value: CoverShapeChoice) = viewModelScope.launch { app.settings.coverShape(value) }
     fun setTvAmbientClock(value: Boolean) = viewModelScope.launch { app.settings.tvAmbientClock(value) }
@@ -5651,6 +6203,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setStartupTab(route: String) = viewModelScope.launch { app.settings.startupTab(route) }
     fun setAutoPlayOnLaunch(value: Boolean) = viewModelScope.launch { app.settings.autoPlayOnLaunch(value) }
+    fun setAutoLyricsIdle(value: Boolean) = viewModelScope.launch { app.settings.autoLyricsIdle(value) }
+    fun setAutoLyricsIdleSeconds(value: Int) = viewModelScope.launch { app.settings.autoLyricsIdleSeconds(value) }
 
     /**
      * 音乐源开关。关掉的平台从启用列表和优先列表里一起消失：聚合搜索、来源条、换源都不再用它，
@@ -5663,9 +6217,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (id in enabled) {
             enabled.remove(id)
             priority.remove(id)
+            // 洛雪保留一个末尾标记：关闭后只参与最后的失败回退，也不会被“首次导入”逻辑重新打开。
+            if (id == LxPlatform.PROVIDER_ID) priority += id
         } else {
             // 重新打开的排到最后：顺序是用户自己排的，不猜它想插在哪儿
             enabled += id
+            priority.remove(id)
             priority += id
         }
         searchEngine.clearCache()
@@ -5675,7 +6232,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     /** 音乐源排序：只在已启用的平台之间挪。这个顺序同时决定聚合搜索、来源条和换源的先后。 */
     fun moveSource(id: String, delta: Int) = viewModelScope.launch {
         val current = settingsState.value.aggregation
-        val available = base.value.providers.map { it.id }.toSet()
+        val available = base.value.providers.map { it.id }.toSet() + LxPlatform.PROVIDER_ID
         // 只排还在平台上的：已经下线的 id 不占位置，否则挪完看着没动
         val list = current.enabledProviders.filter { it in available }.toMutableList()
         val index = list.indexOf(id)
@@ -5741,6 +6298,30 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 if (result.status == "expired" || result.status == "failed") return@launch
             }
+        }
+    }
+
+    /** 用户名密码登录（music.op.wiki）：成功后走和 Cookie 登录完全相同的保存与资料刷新流程。 */
+    fun loginWithPassword(providerId: String, username: String, password: String) {
+        if (username.isBlank() || password.isBlank()) return
+        loginJob?.cancel()
+        base.value = base.value.copy(login = null, loginStatus = "登录中…", loginProviderId = providerId)
+        loginJob = viewModelScope.launch {
+            val provider = NativeProviders.get(providerId)
+            if (provider == null) {
+                base.value = base.value.copy(loginStatus = "登录失败：找不到这个平台")
+                return@launch
+            }
+            val cookie = try {
+                provider.passwordLogin(username.trim(), password)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                base.value = base.value.copy(loginStatus = "登录失败：${error.message ?: "网络错误"}")
+                return@launch
+            }
+            saveCookie(providerId, cookie)
+            message("已登录${provider.info.name}")
         }
     }
 
@@ -6033,6 +6614,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (installLaunching) return
         val file = updateState.value.file ?: return
         installLaunching = true
+        // 安装器会盖住应用：这段时间里播放不因「离开应用」或音频焦点被抢而停，安装窗口的
+        // 起播也不算「主界面起播进歌词页」
+        installKeepPlayingUntil = SystemClock.elapsedRealtime() + INSTALL_KEEP_PLAYING_MS
+        autoLyricsSuppressUntil = SystemClock.elapsedRealtime() + AUTO_LYRICS_SUPPRESS_MS
         try {
             val result = app.update.install(file)
             lastInstallOutcome = result
@@ -6115,6 +6700,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
      * 别的应用拉起来的前台界面）弹一下就一直停着。退出应用（finish）不算，回前台不自动放。
      */
     fun onAppBackgrounded(resumeOnReturn: Boolean = true) {
+        // 刚拉起系统安装器：安装器把界面盖住不算用户离开，播放不停，关掉安装页直接回到应用
+        if (SystemClock.elapsedRealtime() < installKeepPlayingUntil) return
         // 后台播放打开后电视和手机一个行为：谁都不拦，音乐接着放
         if (!isTvLayout() || settingsState.value.tvBackgroundPlay) return
         val player = controller?.takeIf { it.playWhenReady } ?: return
@@ -6134,6 +6721,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (app.carMedia?.let { it.isMuted == true || it.isPausedForMute } == true) return
         if (!isTvLayout()) return
         val player = controller?.takeIf { it.mediaItemCount > 0 && !it.isPlaying } ?: return
+        // 回前台自动续播同启动自动播放一样，不算用户起播
+        autoLyricsSuppressUntil = SystemClock.elapsedRealtime() + AUTO_LYRICS_SUPPRESS_MS
         player.play()
     }
 
@@ -6241,6 +6830,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        lyricon.destroy()
         progressJob?.cancel()
         aggregateSearchJob?.cancel()
         collectionSearchJob?.cancel()
@@ -6262,6 +6852,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val BROWSE_CACHE_MS = 10L * 60 * 1000
+
+        /** 自动接续播放后这段时间内的起播不算「主界面起播进歌词页」（给接续的 play() 事件留的窗口）。 */
+        const val AUTO_LYRICS_SUPPRESS_MS = 4_000L
+
+        /** 拉起系统安装器后这段时间内播放不停；焦点被抢后隔这么久再接回去。 */
+        const val INSTALL_KEEP_PLAYING_MS = 30_000L
+        const val INSTALL_KEEP_PLAYING_RESUME_MS = 500L
 
         /** 授权页最多打开两次还装不上，就认定这台设备走不通那条路，转手动安装。 */
         const val MAX_INSTALL_PERMISSION_ATTEMPTS = 2

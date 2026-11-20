@@ -185,9 +185,12 @@ class SettingsStore(private val context: Context) {
     /** 手机远控（局域网页点歌、剪贴板）的总开关：默认开，关掉后不再随应用自动启动。 */
     private val remoteEnabledKey = booleanPreferencesKey("remote_enabled")
     private val lastSuccessfulUpdateCdnKey = stringPreferencesKey("last_successful_update_cdn")
+    /** 首次冷启动自动导入内置洛雪音源的一次性标记；全部失败不置位，下次冷启动重试。 */
+    private val lxBuiltinImportedKey = booleanPreferencesKey("lx_builtin_imported")
     private val dynamicColorKey = booleanPreferencesKey("dynamic_color")
     private val reduceMotionKey = booleanPreferencesKey("reduce_motion")
     private val volumeNormalizationKey = booleanPreferencesKey("volume_normalization")
+    private val audioQualityKey = stringPreferencesKey("audio_quality")
     private val showBottomNavKey = booleanPreferencesKey("show_bottom_nav")
     private val equalizerEnabledKey = booleanPreferencesKey("equalizer_enabled")
     private val equalizerPresetKey = stringPreferencesKey("equalizer_preset")
@@ -211,9 +214,14 @@ class SettingsStore(private val context: Context) {
     private val crossfadeSecondsKey = intPreferencesKey("crossfade_seconds")
     private val crossfadeAnimationKey = stringPreferencesKey("crossfade_animation")
     private val crossfadeModeKey = stringPreferencesKey("crossfade_mode")
+    /** 主界面长时间无操作且在播放时自动进入歌词页；闲置多少秒算“长时间无操作”见 [autoLyricsIdleSecondsKey]。 */
+    private val autoLyricsIdleKey = booleanPreferencesKey("auto_lyrics_idle")
+    private val autoLyricsIdleSecondsKey = intPreferencesKey("auto_lyrics_idle_seconds")
     private val cacheLimitKey = intPreferencesKey("cache_limit_mb")
     private val lyricsBackgroundKey = stringPreferencesKey("lyrics_background")
     private val notificationLyricsKey = booleanPreferencesKey("notification_lyrics")
+    private val lyriconProviderEnabledKey = booleanPreferencesKey("lyricon_provider_enabled")
+    private val lyriconSubscriberEnabledKey = booleanPreferencesKey("lyricon_subscriber_enabled")
     /** Apple Music 匿名歌词走第三方中转（zarz / paxsenix / AMLL）的总开关。 */
     private val thirdPartyLyricsKey = booleanPreferencesKey("third_party_lyrics")
     private val rhythmIntensityKey = stringPreferencesKey("rhythm_intensity")
@@ -280,12 +288,16 @@ class SettingsStore(private val context: Context) {
             mcpBinding = values[mcpBindingKey] ?: "",
             remoteEnabled = values[remoteEnabledKey] ?: true,
             lastSuccessfulUpdateCdn = values[lastSuccessfulUpdateCdnKey] ?: "",
+            lxBuiltinImported = values[lxBuiltinImportedKey] ?: false,
             dynamicColor = values[dynamicColorKey] ?: false,
             reduceMotion = values[reduceMotionKey] ?: false,
             volumeNormalization = values[volumeNormalizationKey] ?: false,
+            audioQuality = values[audioQualityKey] ?: "auto",
             showBottomNav = values[showBottomNavKey] ?: true,
             lyricsBackground = values[lyricsBackgroundKey].toLyricsBackgroundMode(),
             notificationLyrics = values[notificationLyricsKey] ?: false,
+            lyriconProviderEnabled = values[lyriconProviderEnabledKey] ?: true,
+            lyriconSubscriberEnabled = values[lyriconSubscriberEnabledKey] ?: false,
             rhythmIntensity = values[rhythmIntensityKey].toRhythmIntensity(),
             coverShape = values[coverShapeKey].toCoverShapeChoice(),
             tvAmbientClock = values[tvAmbientClockKey] ?: true,
@@ -335,6 +347,8 @@ class SettingsStore(private val context: Context) {
             crossfadeSeconds = (values[crossfadeSecondsKey] ?: 6).coerceIn(4, 10),
             crossfadeAnimation = values[crossfadeAnimationKey] ?: CrossfadeAnimation.Ring.name,
             crossfadeMode = values[crossfadeModeKey] ?: CrossfadeMode.Automix.name,
+            autoLyricsIdle = values[autoLyricsIdleKey] ?: true,
+            autoLyricsIdleSeconds = (values[autoLyricsIdleSecondsKey] ?: 30).coerceIn(15, 120),
             cacheLimitMb = values[cacheLimitKey] ?: 0,
         )
     }
@@ -344,6 +358,7 @@ class SettingsStore(private val context: Context) {
     suspend fun remoteEnabled(value: Boolean) = context.dataStore.edit { it[remoteEnabledKey] = value }
     suspend fun mcpBinding(value: String) = context.dataStore.edit { it[mcpBindingKey] = value }
     suspend fun lastSuccessfulUpdateCdn(value: String) = context.dataStore.edit { it[lastSuccessfulUpdateCdnKey] = value }
+    suspend fun lxBuiltinImported(value: Boolean) = context.dataStore.edit { it[lxBuiltinImportedKey] = value }
     suspend fun chartsSource(value: String) = context.dataStore.edit { it[chartsSourceKey] = value }
     suspend fun playlistsSource(value: String) = context.dataStore.edit { it[playlistsSourceKey] = value }
     suspend fun startupTab(value: String) = context.dataStore.edit { it[startupTabKey] = value }
@@ -355,6 +370,7 @@ class SettingsStore(private val context: Context) {
     suspend fun dynamicColor(value: Boolean) = context.dataStore.edit { it[dynamicColorKey] = value }
     suspend fun reduceMotion(value: Boolean) = context.dataStore.edit { it[reduceMotionKey] = value }
     suspend fun volumeNormalization(value: Boolean) = context.dataStore.edit { it[volumeNormalizationKey] = value }
+    suspend fun audioQuality(value: String) = context.dataStore.edit { it[audioQualityKey] = value }
     suspend fun showBottomNav(value: Boolean) = context.dataStore.edit { it[showBottomNavKey] = value }
     suspend fun colorSource(value: String) = context.dataStore.edit { it[colorSourceKey] = value }
     suspend fun customSeed(value: Int) = context.dataStore.edit { it[customSeedKey] = value }
@@ -369,6 +385,8 @@ class SettingsStore(private val context: Context) {
     suspend fun lyricsAlignment(value: String) = context.dataStore.edit { it[lyricsAlignmentKey] = value }
     suspend fun lyricsBackground(value: LyricsBackgroundMode) = context.dataStore.edit { it[lyricsBackgroundKey] = value.name }
     suspend fun notificationLyrics(value: Boolean) = context.dataStore.edit { it[notificationLyricsKey] = value }
+    suspend fun lyriconProviderEnabled(value: Boolean) = context.dataStore.edit { it[lyriconProviderEnabledKey] = value }
+    suspend fun lyriconSubscriberEnabled(value: Boolean) = context.dataStore.edit { it[lyriconSubscriberEnabledKey] = value }
     suspend fun rhythmIntensity(value: RhythmIntensity) = context.dataStore.edit { it[rhythmIntensityKey] = value.name }
     suspend fun coverShape(value: CoverShapeChoice) = context.dataStore.edit { it[coverShapeKey] = value.name }
     suspend fun tvAmbientClock(value: Boolean) = context.dataStore.edit { it[tvAmbientClockKey] = value }
@@ -401,6 +419,8 @@ class SettingsStore(private val context: Context) {
         context.dataStore.edit { it[crossfadeAnimationKey] = value.name }
     suspend fun crossfadeMode(value: CrossfadeMode) =
         context.dataStore.edit { it[crossfadeModeKey] = value.name }
+    suspend fun autoLyricsIdle(value: Boolean) = context.dataStore.edit { it[autoLyricsIdleKey] = value }
+    suspend fun autoLyricsIdleSeconds(value: Int) = context.dataStore.edit { it[autoLyricsIdleSecondsKey] = value.coerceIn(15, 120) }
     suspend fun cacheLimitMb(value: Int) = context.dataStore.edit { it[cacheLimitKey] = value }
 
     /** 墙内设置：在同一次 edit 里读出当前值再写回，连着点两个开关也不会互相覆盖。 */
@@ -635,13 +655,20 @@ data class AppSettings(
     /** 手机远控是否随应用自动启动；默认开。 */
     val remoteEnabled: Boolean = true,
     val lastSuccessfulUpdateCdn: String = "",
+    /** 首次冷启动是否已自动导入过内置洛雪音源；导入全部失败不置位，下次冷启动重试。 */
+    val lxBuiltinImported: Boolean = false,
     val dynamicColor: Boolean = false,
     val reduceMotion: Boolean = false,
     val volumeNormalization: Boolean = false,
+    /** 播放音质偏好：`auto` 或某个 `AudioQuality.id`。平台不支持所选档位时按 auto 处理。 */
+    val audioQuality: String = "auto",
     val showBottomNav: Boolean = true,
     val lyricsBackground: LyricsBackgroundMode = LyricsBackgroundMode.Ambient,
     /** 系统媒体播放条第二行显示当前歌词（顶掉歌手名）；默认关。 */
     val notificationLyrics: Boolean = false,
+    /** 词幕 Provider 默认开；Subscriber 只在用户主动打开后连接。两项都只存在本机。 */
+    val lyriconProviderEnabled: Boolean = true,
+    val lyriconSubscriberEnabled: Boolean = false,
     val rhythmIntensity: RhythmIntensity = RhythmIntensity.Standard,
     val coverShape: CoverShapeChoice = CoverShapeChoice.Random,
     /** 电视环境模式右上角是否显示时钟。 */
@@ -702,6 +729,10 @@ data class AppSettings(
     val crossfadeAnimation: String = "Ring",
     /** 交叉淡化还是智能过渡，见 [CrossfadeMode]。 */
     val crossfadeMode: String = "Automix",
+    /** 主界面无操作自动进歌词页的总开关：闲置计时和起播跳转都由它控制。 */
+    val autoLyricsIdle: Boolean = true,
+    /** 主界面多少秒无操作后自动进歌词页。 */
+    val autoLyricsIdleSeconds: Int = 30,
     /** 播放缓存上限（MB），0 表示按设备默认：电视 256，其他 512。 */
     val cacheLimitMb: Int = 0,
 )

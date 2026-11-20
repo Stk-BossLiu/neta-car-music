@@ -32,6 +32,10 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material.icons.filled.Album
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.ui.text.style.TextOverflow
+import io.neta.music.ui.artist.splitArtistNames
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -134,8 +138,8 @@ fun PlayerScreen(
     // 暂停时也照样计时：控制栏几秒后淡出，按确认键或点按唤醒。桌面姿态下半屏是平放着用手点的那一面，不进入空闲
     var animationOpen by rememberSaveable { mutableStateOf(false) }
     val idle = rememberIdleState(holdAwake = sheetOpen || animationOpen || state.sourcePickerTrack != null || tabletop)
-    // 电视环境模式下按住左右键切歌的按键状态，跨重组保留到松开
-    val holdSkip = remember { HoldSkip() }
+    // 电视环境模式（全屏歌词页）里快退快进的浮层提示：按左右方向键时显示，1.2 秒淡出
+    val seekHint = remember { SeekHint() }
     PredictiveBackHandler { events ->
         // 电视上控制栏亮着时，返回键先收起控制栏；已经在环境模式下才退出播放页，和常见视频播放器一致
         val hideControls = window.isTv && !lyricsMode && idle.canAutoHide &&
@@ -201,6 +205,13 @@ fun PlayerScreen(
     val sourceDetail = source?.qualityLabel?.takeUnless { it == "音质未知" }.orEmpty()
     val playbackMode = modeLabel(state.aggregation.playbackMode)
     val onSkip: (Int) -> Unit = { direction -> actions.transport(if (direction > 0) "next" else "previous") }
+    // 电视全屏歌词页的快退快进：直播没有进度可拖，按了也不提示
+    val onSeekBy: (Long) -> Unit = { delta ->
+        if (!song.isLive) {
+            seekHint.show(delta)
+            actions.seek(seekStepTarget(position.value, delta, state.duration))
+        }
+    }
     val onOpenSource: () -> Unit = {
         state.currentTrack?.let { track -> actions.openSource(track, state.canonicalQueue.ifEmpty { listOf(track) }) }
     }
@@ -226,8 +237,8 @@ fun PlayerScreen(
             .wakeOnInput(
                 idle,
                 consumeKeyWhenIdle = window.isTv,
-                holdSkip = holdSkip.takeIf { window.isTv },
                 onSkip = onSkip,
+                onSeekBy = onSeekBy,
                 onAnyKey = { io.neta.music.playback.CrossfadeStatus.dismissActive() },
             ),
     ) {
@@ -274,6 +285,7 @@ fun PlayerScreen(
                 coverShape = state.coverShape,
                 transitionAnimation = state.crossfadeAnimation,
                 ambientClock = state.tvAmbientClock,
+                seekHint = seekHint,
                 onOpenQueue = onOpenQueue,
                 onOpenTimer = onOpenTimer,
                 onOpenSource = onOpenSource,
@@ -448,6 +460,23 @@ internal fun MoreMenu(
             // 收起播放页，露出队列海报墙
             DropdownMenuItem(text = { Text("海报墙") }, leadingIcon = { Icon(Icons.Filled.GridView, null) }, onClick = { open = false; actions.openPosterWall() })
             DropdownMenuItem(text = { Text("选择音源") }, leadingIcon = { Icon(Icons.Filled.SwapHoriz, null) }, onClick = { open = false; onOpenSource() })
+            // 收起播放页，打开歌手页 / 专辑页；直播（电台）没有这两项
+            if (!song.isLive) {
+                splitArtistNames(song.artist).take(3).forEach { name ->
+                    DropdownMenuItem(
+                        text = { Text("歌手：$name", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        leadingIcon = { Icon(Icons.Filled.Person, null) },
+                        onClick = { open = false; actions.openArtistByName(name, song) },
+                    )
+                }
+                if (song.album.isNotBlank()) {
+                    DropdownMenuItem(
+                        text = { Text("专辑：${song.album}", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        leadingIcon = { Icon(Icons.Filled.Album, null) },
+                        onClick = { open = false; actions.openAlbumOf(song) },
+                    )
+                }
+            }
             DropdownMenuItem(text = { Text("下载到本机") }, leadingIcon = { Icon(Icons.Filled.Download, null) }, onClick = { open = false; actions.download(song) })
             if (deepLink.isNotBlank()) {
                 DropdownMenuItem(text = { Text("在平台打开") }, onClick = { open = false; actions.openDeepLink() })

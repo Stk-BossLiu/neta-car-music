@@ -1,6 +1,7 @@
 package io.neta.music.playback
 
 import io.neta.music.AppLog
+import io.neta.music.data.native.MHubTls
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -109,7 +110,11 @@ class PlaybackService : MediaSessionService() {
         val drmInfoLogged = java.util.concurrent.atomic.AtomicBoolean(false)
         // 本地歌的 WebDAV 副本要带认证和证书钉住：按地址把 WebDAV 服务器下面的请求交给它自己的客户端，
         // 其余原样走默认工厂。包在缓存里面，云端副本和在线歌一样进播放缓存，但不会存进“下载”
-        val upstream = app?.cloud?.routing(DefaultDataSource.Factory(this)) ?: DefaultDataSource.Factory(this)
+        // music.op.wiki 的音频要绕过证书校验（它的证书链在部分系统上不被信任），按域名把这两个
+        // 主机的地址交给 OkHttp，别的源照旧走系统默认那套。见 MHubTls。
+        val upstream = MHubTls.RoutingFactory(
+            fallback = app?.cloud?.routing(DefaultDataSource.Factory(this)) ?: DefaultDataSource.Factory(this),
+        )
         val baseFactory = DefaultMediaSourceFactory(
                 cache?.let {
                     val direct = upstream
@@ -235,7 +240,9 @@ class PlaybackService : MediaSessionService() {
             .setMediaSourceFactory(mediaSourceFactory)
         app?.let {
             builder.setRenderersFactory(
-                RhythmRenderersFactory(this, it.rhythmAnalyzer, source, crossfadeParams[source]),
+                // FLAC 统一用内嵌的 libFLAC，绕开厂商 24 位解码器的卡死/静音；其它格式不受影响
+                RhythmRenderersFactory(this, it.rhythmAnalyzer, source, crossfadeParams[source])
+                    .apply { setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER) },
             )
         }
         val created = builder.build()

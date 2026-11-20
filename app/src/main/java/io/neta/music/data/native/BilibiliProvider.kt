@@ -147,7 +147,7 @@ class BilibiliProvider : BaseNativeProvider(BILIBILI_INFO) {
         )
     }
 
-    override suspend fun downloadUrl(cookie: String, song: Song): String {
+    override suspend fun downloadUrl(cookie: String, song: Song, quality: AudioQuality): String {
         if (song.source != "bilibili") throw IllegalArgumentException("source mismatch")
         if (song.url.isNotEmpty()) return song.url
 

@@ -1,6 +1,10 @@
 package io.neta.music.data
 
+import io.neta.music.data.lx.LxPlayback
+import io.neta.music.data.lx.LxPlaybackResult
+import io.neta.music.data.lx.LxSources
 import io.neta.music.data.native.AccountInfo
+import io.neta.music.data.native.AudioQuality
 import io.neta.music.data.native.NativeProvider
 import io.neta.music.data.native.NativeProviders
 import io.neta.music.data.native.PlayableStream
@@ -8,7 +12,9 @@ import io.neta.music.data.native.SongSearchPage
 import java.io.File
 
 /** open 供测试替身覆写 playableStream，不发起真实网络请求。 */
-open class MusicRepository {
+open class MusicRepository(
+    private val lxPlayback: LxPlayback = LxSources,
+) {
     suspend fun providers(): List<ProviderInfo> = NativeProviders.infos()
 
     suspend fun searchSongs(provider: String, cookie: String, keyword: String): List<Song> =
@@ -28,8 +34,23 @@ open class MusicRepository {
     suspend fun parseSong(provider: String, cookie: String, link: String): Song =
         requireProvider(provider).parseSong(cookie, link)
 
-    open suspend fun playableStream(song: Song, cookie: String, workDir: File): PlayableStream =
-        requireProvider(song.source).playableStream(cookie, song, workDir)
+    open suspend fun playableStream(
+        song: Song,
+        cookie: String,
+        workDir: File,
+        quality: AudioQuality = AudioQuality.Auto,
+    ): PlayableStream = requireProvider(song.source).playableStream(cookie, song, workDir, quality)
+
+    /** 统一的洛雪播放候选：脚本按自定义音源顺序跨平台尝试，原生接口不在这里兜底。 */
+    open suspend fun playableLxStream(songs: List<Song>, quality: AudioQuality): LxPlaybackResult? =
+        lxPlayback.resolve(songs, quality.id)
+
+    /** 当前账号在这个平台上实际能选的音质档，从高到低；空表表示只有“自动”。 */
+    suspend fun availableQualityOptions(provider: String, cookie: String) =
+        requireProvider(provider).availableQualityOptions(cookie)
+
+    open fun supportsCustomSource(provider: String): Boolean = lxPlayback.supports(provider)
+    open fun customSourceGeneration(): Long = lxPlayback.generation
 
     suspend fun lyrics(song: Song, cookie: String): String =
         requireProvider(song.source).lyrics(cookie, song)
@@ -67,6 +88,15 @@ open class MusicRepository {
     suspend fun parseAlbum(provider: String, cookie: String, link: String): CollectionResult =
         requireProvider(provider).parseAlbum(cookie, link)
 
+    suspend fun artistDetail(provider: String, cookie: String, id: String): ArtistDetail =
+        requireProvider(provider).artistDetail(cookie, id)
+
+    suspend fun artistAlbums(provider: String, cookie: String, id: String, page: Int, limit: Int): ArtistAlbumPage =
+        requireProvider(provider).artistAlbums(cookie, id, page, limit)
+
+    suspend fun albumDetail(provider: String, cookie: String, id: String): AlbumDetail =
+        requireProvider(provider).albumDetail(cookie, id)
+
     suspend fun categories(provider: String, cookie: String): List<PlaylistCategory> =
         requireProvider(provider).categories(cookie)
 
@@ -92,6 +122,11 @@ open class MusicRepository {
         val provider = NativeProviders.providerForSession(sessionId)
             ?: throw IllegalArgumentException("unknown login session: $sessionId")
         return provider.checkLogin(sessionId, key)
+    }
+
+    /** 放弃扫码登录：通知平台释放它占用的资源（隐藏 WebView、会话）。 */
+    fun cancelLogin(sessionId: String) {
+        NativeProviders.providerForSession(sessionId)?.cancelLogin(sessionId)
     }
 
     /** 登录账号资料；失败或平台没实现时返回 null。 */

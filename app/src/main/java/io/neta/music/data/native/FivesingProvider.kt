@@ -72,7 +72,7 @@ class FivesingProvider : BaseNativeProvider(FIVESING_INFO) {
         return fetchSongInfo(cookie, match.groupValues[2], match.groupValues[1])
     }
 
-    override suspend fun downloadUrl(cookie: String, song: Song): String {
+    override suspend fun downloadUrl(cookie: String, song: Song, quality: AudioQuality): String {
         if (song.source != "fivesing") throw IllegalArgumentException("source mismatch")
         if (song.url.isNotBlank()) return song.url
         val (songId, songType) = songParts(song)

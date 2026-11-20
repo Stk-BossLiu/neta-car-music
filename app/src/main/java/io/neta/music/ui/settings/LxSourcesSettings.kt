@@ -1,0 +1,559 @@
+package io.neta.music.ui.settings
+
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.FileOpen
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SwapVert
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import io.neta.music.data.lx.LxBuiltinSource
+import io.neta.music.data.lx.LxBuiltinSources
+import io.neta.music.data.lx.LxPlatform
+import io.neta.music.data.lx.LxSourceRecord
+import io.neta.music.data.lx.LxSources
+import io.neta.music.data.lx.MAX_LX_SOURCES
+import io.neta.music.ui.MusicUiState
+import io.neta.music.ui.components.AdaptiveSheet
+import io.neta.music.ui.components.ScanInputIcons
+import io.neta.music.ui.components.ConnectedToggleGroup
+import io.neta.music.ui.components.IconTone
+import io.neta.music.ui.components.ListRow
+import io.neta.music.ui.components.SectionLabel
+import io.neta.music.ui.components.SegmentedGroup
+import io.neta.music.ui.components.tvFocusRing
+
+/** 音乐源页只留一个入口，不把整套管理器塞进内置平台列表。 */
+@Composable
+internal fun LxSourcesSettingsEntry(onClick: () -> Unit) {
+    val records by LxSources.records.collectAsState()
+    ListRow(
+        title = "自定义音源",
+        index = 0,
+        count = 1,
+        onClick = onClick,
+        icon = Icons.Filled.Code,
+        summary = if (records.isEmpty()) {
+            "落雪脚本 · 在线或本地导入"
+        } else {
+            "${records.count { it.enabled }} 个已启用 · 共 ${records.size} 个"
+        },
+    )
+}
+
+@Composable
+internal fun LxSourcesSettingsScreen(
+    state: MusicUiState,
+    onBack: () -> Unit,
+    embedded: Boolean = false,
+    model: LxSourcesViewModel = viewModel(),
+) {
+    val records by model.records.collectAsState()
+    val operations by model.operations.collectAsState()
+    val notice by model.notice.collectAsState()
+    var importOpen by rememberSaveable { mutableStateOf(false) }
+    var selectedId by remember { mutableStateOf<String?>(null) }
+    var replaceId by remember { mutableStateOf<String?>(null) }
+    var deleteFor by remember { mutableStateOf<LxSourceRecord?>(null) }
+    val openUri = rememberOpenUri()
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            val target = replaceId
+            model.importLocal(uri, target) {
+                importOpen = false
+                replaceId = null
+            }
+        }
+    }
+
+    SettingsPage(SettingsSection.LxSources, embedded, onBack) {
+        item(key = "add", contentType = "settingRow") {
+            ListRow(
+                title = "添加自定义音源",
+                index = 0,
+                count = 1,
+                onClick = if (records.size < MAX_LX_SOURCES) ({ importOpen = true }) else null,
+                icon = Icons.Filled.Add,
+                iconTone = IconTone.Primary,
+                summary = when {
+                    records.size >= MAX_LX_SOURCES -> "最多保存 $MAX_LX_SOURCES 个音源"
+                    records.isEmpty() -> "在线地址、本地文件或内置音源"
+                    else -> "在线、本地或内置 · 已添加 ${records.size} 个"
+                },
+                showChevron = records.size < MAX_LX_SOURCES,
+            )
+        }
+        if (records.isEmpty()) {
+            item(key = "empty", contentType = "note") {
+                SettingsNote("还没有自定义音源。可以添加多个落雪脚本，为已有平台增加取流通道，不改变搜索和榜单来源。")
+            }
+        } else {
+            item(key = "sourcesHead", contentType = "sectionHeader") {
+                SectionLabel("我的音源") {
+                    Text(
+                        "${records.count { it.enabled }} / ${records.size} 已启用",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            item(key = "sources", contentType = "sourceList") {
+                SegmentedGroup {
+                    records.forEachIndexed { index, record ->
+                        ListRow(
+                            title = record.name,
+                            index = index,
+                            count = records.size,
+                            onClick = { selectedId = record.id },
+                            icon = Icons.Filled.Code,
+                            summary = sourceSummary(record),
+                            showChevron = false,
+                            trailing = {
+                                Switch(
+                                    checked = record.enabled,
+                                    onCheckedChange = { model.setEnabled(record, !record.enabled) },
+                                    modifier = Modifier.semantics {
+                                        contentDescription = "${if (record.enabled) "关闭" else "启用"}${record.name}"
+                                    },
+                                )
+                            },
+                        )
+                    }
+                }
+            }
+            item(key = "sourcesNote", contentType = "note") {
+                SettingsNote("这里只调整统一「洛雪」内部的脚本顺序。全部脚本失败后，按播放与换源设置继续回退；点按音源可测试、更新、排序或删除。")
+            }
+        }
+        operations.message.takeIf { it.isNotBlank() }?.let { message ->
+            item(key = "message", contentType = "note") {
+                ListRow(
+                    title = message,
+                    index = 0,
+                    count = 1,
+                    onClick = model::clearMessage,
+                    summary = "点按关闭提示",
+                    showChevron = false,
+                )
+            }
+        }
+    }
+
+    val selected = records.firstOrNull { it.id == selectedId }
+    selected?.let { record ->
+        LxSourceDetailSheet(
+            record = record,
+            index = records.indexOfFirst { it.id == record.id },
+            count = records.size,
+            testing = "test:${record.id}" in operations.busy,
+            updating = "update:${record.id}" in operations.busy,
+            testResult = operations.tests[record.id].orEmpty(),
+            error = operations.errors["test:${record.id}"]
+                ?: operations.errors["update:${record.id}"]
+                ?: operations.errors["toggle:${record.id}"]
+                ?: operations.errors["move:${record.id}"],
+            onDismiss = { selectedId = null },
+            onTest = { model.test(record, state.current, state.cookies) },
+            onUpdate = { model.update(record) },
+            onReplace = {
+                replaceId = record.id
+                filePicker.launch(arrayOf("*/*"))
+            },
+            onMove = { model.move(record, it) },
+            onDelete = { deleteFor = record },
+            onOpenHomepage = { if (record.homepage.isNotBlank()) openUri(record.homepage) },
+        )
+    }
+    if (importOpen) {
+        LxImportSheet(
+            busy = "import" in operations.busy,
+            error = operations.errors["import"].orEmpty(),
+            records = records,
+            builtinBusy = operations.busy.filterTo(mutableSetOf()) { it.startsWith("builtin:") },
+            builtinError = operations.errors.filterKeys { it.startsWith("builtin:") }.values.lastOrNull().orEmpty(),
+            onDismiss = {
+                if ("import" !in operations.busy && operations.busy.none { it.startsWith("builtin:") }) importOpen = false
+            },
+            onImport = { url -> model.importOnline(url) { importOpen = false } },
+            onFile = {
+                replaceId = null
+                filePicker.launch(arrayOf("*/*"))
+            },
+            onOpenCatalog = { openUri("https://github.com/pdone/lx-music-source") },
+            onImportBuiltin = { model.importBuiltin(it) },
+            onImportAllBuiltin = { model.importAllBuiltin() },
+        )
+    }
+    deleteFor?.let { record ->
+        AlertDialog(
+            onDismissRequest = { deleteFor = null },
+            title = { Text("删除 ${record.name}？") },
+            text = { Text("会删除本机保存的脚本；已有歌曲和歌单不会删除，之后取流回退到内置接口。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    model.delete(record)
+                    selectedId = null
+                    deleteFor = null
+                }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { deleteFor = null }) { Text("取消") } },
+        )
+    }
+    notice?.let { update ->
+        AlertDialog(
+            onDismissRequest = model::dismissNotice,
+            title = { Text("${update.name} 有更新提示") },
+            text = { Text(update.log, Modifier.verticalScroll(rememberScrollState())) },
+            confirmButton = {
+                if (update.updateUrl.startsWith("http://") || update.updateUrl.startsWith("https://")) {
+                    TextButton(onClick = {
+                        openUri(update.updateUrl)
+                        model.dismissNotice()
+                    }) { Text("查看更新") }
+                } else {
+                    TextButton(onClick = model::dismissNotice) { Text("知道了") }
+                }
+            },
+            dismissButton = if (update.updateUrl.isNotBlank()) {
+                { TextButton(onClick = model::dismissNotice) { Text("关闭") } }
+            } else null,
+        )
+    }
+}
+
+@Composable
+private fun LxSourceDetailSheet(
+    record: LxSourceRecord,
+    index: Int,
+    count: Int,
+    testing: Boolean,
+    updating: Boolean,
+    testResult: String,
+    error: String?,
+    onDismiss: () -> Unit,
+    onTest: () -> Unit,
+    onUpdate: () -> Unit,
+    onReplace: () -> Unit,
+    onMove: (Int) -> Unit,
+    onDelete: () -> Unit,
+    onOpenHomepage: () -> Unit,
+) {
+    AdaptiveSheet(onDismiss = onDismiss, title = record.name, subtitle = sourceSubtitle(record)) {
+        Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp)) {
+            if (record.description.isNotBlank()) {
+                Text(
+                    record.description,
+                    Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            SegmentedGroup {
+                ListRow(
+                    title = "支持平台与音质",
+                    index = 0,
+                    count = if (record.homepage.isBlank()) 1 else 2,
+                    onClick = null,
+                    icon = Icons.Filled.Tune,
+                    summary = sourceCapabilities(record),
+                    showChevron = false,
+                )
+                if (record.homepage.isNotBlank()) {
+                    ListRow(
+                        title = "脚本主页",
+                        index = 1,
+                        count = 2,
+                        onClick = onOpenHomepage,
+                        icon = Icons.AutoMirrored.Filled.OpenInNew,
+                        summary = record.homepage.substringAfter("://").substringBefore('/'),
+                    )
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            SegmentedGroup {
+                ListRow(
+                    title = "测试取流",
+                    index = 0,
+                    count = 4,
+                    onClick = if (testing) null else onTest,
+                    icon = Icons.Filled.PlayArrow,
+                    iconTone = IconTone.Primary,
+                    summary = if (testing) "正在执行脚本并读取媒体…" else "检查脚本和真实媒体响应",
+                    showChevron = false,
+                    trailing = if (testing) {
+                        { LoadingIndicator(Modifier.size(24.dp)) }
+                    } else null,
+                )
+                ListRow(
+                    title = if (record.sourceUrl.isBlank()) "替换脚本" else "更新脚本",
+                    index = 1,
+                    count = 4,
+                    onClick = if (updating) null else if (record.sourceUrl.isBlank()) onReplace else onUpdate,
+                    icon = if (record.sourceUrl.isBlank()) Icons.Filled.FileOpen else Icons.Filled.Refresh,
+                    summary = if (updating) "正在下载并验证…" else if (record.sourceUrl.isBlank()) "选择新的本地文件" else "从原地址下载最新版本",
+                    showChevron = false,
+                    trailing = if (updating) {
+                        { LoadingIndicator(Modifier.size(24.dp)) }
+                    } else null,
+                )
+                ListRow(
+                    title = "调整顺序",
+                    index = 2,
+                    count = 4,
+                    onClick = null,
+                    icon = Icons.Filled.SwapVert,
+                    summary = "第 ${index + 1} 位，共 $count 个音源",
+                    showChevron = false,
+                    trailing = {
+                        IconButton(onClick = { onMove(-1) }, enabled = index > 0) {
+                            Icon(Icons.Filled.KeyboardArrowUp, "上移${record.name}")
+                        }
+                        IconButton(onClick = { onMove(1) }, enabled = index < count - 1) {
+                            Icon(Icons.Filled.KeyboardArrowDown, "下移${record.name}")
+                        }
+                    },
+                )
+                ListRow(
+                    title = "删除音源",
+                    index = 3,
+                    count = 4,
+                    onClick = onDelete,
+                    icon = Icons.Filled.DeleteOutline,
+                    iconTone = IconTone.Error,
+                    summary = "只删除本机脚本，不影响歌曲和歌单",
+                    danger = true,
+                    showChevron = false,
+                )
+            }
+            if (testResult.isNotBlank()) {
+                Text(
+                    testResult,
+                    Modifier.padding(horizontal = 4.dp, vertical = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (!error.isNullOrBlank()) {
+                Text(
+                    error,
+                    Modifier.padding(horizontal = 4.dp, vertical = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LxImportSheet(
+    busy: Boolean,
+    error: String,
+    records: List<LxSourceRecord>,
+    builtinBusy: Set<String>,
+    builtinError: String,
+    onDismiss: () -> Unit,
+    onImport: (String) -> Unit,
+    onFile: () -> Unit,
+    onOpenCatalog: () -> Unit,
+    onImportBuiltin: (LxBuiltinSource) -> Unit,
+    onImportAllBuiltin: () -> Unit,
+) {
+    var mode by rememberSaveable { mutableStateOf("online") }
+    var url by rememberSaveable { mutableStateOf("") }
+    val clipboard = LocalClipboardManager.current
+    AdaptiveSheet(onDismiss = onDismiss, title = "添加自定义音源", subtitle = "兼容落雪音乐移动端 JavaScript 脚本") {
+        Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
+            ConnectedToggleGroup(
+                options = listOf("online", "local", "builtin"),
+                selected = mode,
+                onSelect = { mode = it },
+                label = { if (it == "online") "在线地址" else if (it == "local") "本地文件" else "内置音源" },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(16.dp))
+            if (mode == "online") {
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("脚本地址") },
+                    placeholder = { Text("https://…/latest.js") },
+                    singleLine = true,
+                    enabled = !busy,
+                    trailingIcon = { ScanInputIcons("脚本地址", enabled = !busy, onValueChange = { url = it }) },
+                )
+                TextButton(onClick = onOpenCatalog, enabled = !busy, modifier = Modifier.align(Alignment.End)) {
+                    Text("打开 pdone 音源合集")
+                    Spacer(Modifier.width(4.dp))
+                    Icon(Icons.AutoMirrored.Filled.OpenInNew, null, Modifier.size(16.dp))
+                }
+                Button(
+                    onClick = { onImport(url) },
+                    enabled = url.isNotBlank() && !busy,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).tvFocusRing(),
+                ) {
+                    if (busy) LoadingIndicator(Modifier.size(20.dp))
+                    Text(if (busy) "下载并验证中…" else "下载并导入", Modifier.padding(start = 8.dp))
+                }
+            } else if (mode == "local") {
+                ListRow(
+                    title = if (busy) "正在读取并验证…" else "选择 .js 脚本",
+                    index = 0,
+                    count = 1,
+                    onClick = if (busy) null else onFile,
+                    icon = Icons.Filled.FileOpen,
+                    summary = "UTF-8 编码 · 最大 2 MB",
+                    showChevron = !busy,
+                    trailing = if (busy) {
+                        { LoadingIndicator(Modifier.size(24.dp)) }
+                    } else null,
+                )
+            } else {
+                BuiltinSourceList(
+                    records = records,
+                    builtinBusy = builtinBusy,
+                    onImportBuiltin = onImportBuiltin,
+                    onImportAllBuiltin = onImportAllBuiltin,
+                )
+            }
+            val shownError = if (mode == "builtin") builtinError else error
+            if (shownError.isNotBlank()) {
+                Text(
+                    shownError,
+                    Modifier.padding(top = 12.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            SettingsNote("只导入信任的脚本。脚本可以访问网络，但不会获得 myMusic 保存的平台 Cookie。验证失败不会保存。")
+        }
+    }
+}
+
+@Composable
+private fun BuiltinSourceList(
+    records: List<LxSourceRecord>,
+    builtinBusy: Set<String>,
+    onImportBuiltin: (LxBuiltinSource) -> Unit,
+    onImportAllBuiltin: () -> Unit,
+) {
+    val addedUrls = records.map { it.sourceUrl }.toSet()
+    val full = records.size >= MAX_LX_SOURCES
+    val importingAll = "builtin:all" in builtinBusy
+    val pending = LxBuiltinSources.all.filter { it.url !in addedUrls }
+    SegmentedGroup {
+        LxBuiltinSources.all.forEachIndexed { index, source ->
+            val added = source.url in addedUrls
+            val busy = "builtin:${source.name}" in builtinBusy
+            ListRow(
+                title = source.name,
+                index = index,
+                count = LxBuiltinSources.all.size,
+                onClick = when {
+                    added || busy || importingAll || full -> null
+                    else -> ({ onImportBuiltin(source) })
+                },
+                icon = if (added) Icons.Filled.Check else Icons.Filled.Download,
+                iconTone = if (added) IconTone.Primary else IconTone.Secondary,
+                summary = when {
+                    busy -> "正在下载并验证…"
+                    added -> "已添加 · 在“我的音源”中管理"
+                    full -> "音源已达上限"
+                    else -> "pdone 合集 · ${source.url.substringBeforeLast('/').substringAfterLast('/')}/${source.url.substringAfterLast('/')}"
+                },
+                showChevron = false,
+                trailing = if (busy) {
+                    { LoadingIndicator(Modifier.size(24.dp)) }
+                } else null,
+            )
+        }
+    }
+    if (pending.isNotEmpty() && !full) {
+        Button(
+            onClick = onImportAllBuiltin,
+            enabled = !importingAll && builtinBusy.isEmpty(),
+            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).tvFocusRing().padding(top = 12.dp),
+        ) {
+            if (importingAll) LoadingIndicator(Modifier.size(20.dp))
+            Text(
+                if (importingAll) "正在添加…" else "全部添加（${pending.size} 个）",
+                Modifier.padding(start = 8.dp),
+            )
+        }
+    }
+}
+
+private fun sourceSubtitle(record: LxSourceRecord): String = listOf(
+    record.version.takeIf { it.isNotBlank() }?.let { "v$it" }.orEmpty(),
+    record.author,
+    if (record.sourceUrl.isBlank()) "本地脚本" else "在线脚本",
+).filter { it.isNotBlank() }.joinToString(" · ")
+
+private fun sourceSummary(record: LxSourceRecord): String = listOf(
+    sourceSubtitle(record),
+    sourcePlatforms(record),
+).filter { it.isNotBlank() }.joinToString("\n")
+
+private fun sourceCapabilities(record: LxSourceRecord): String {
+    val qualities = record.capabilities.values.flatMap { it.qualities }.distinct()
+    return listOf(
+        sourcePlatforms(record),
+        qualities.takeIf { it.isNotEmpty() }?.joinToString(" · ", prefix = "音质：") { qualityLabel(it) }.orEmpty(),
+    ).filter { it.isNotBlank() }.joinToString("\n")
+}
+
+private fun sourcePlatforms(record: LxSourceRecord): String = LxPlatform.labels.mapNotNull { (source, label) ->
+    val capability = record.capabilities[source] ?: return@mapNotNull null
+    if ("musicUrl" in capability.actions) label else null
+}.joinToString(" · ")
+
+private fun qualityLabel(quality: String): String = when (quality) {
+    "flac" -> "FLAC"
+    "flac24bit" -> "24bit"
+    else -> quality
+}

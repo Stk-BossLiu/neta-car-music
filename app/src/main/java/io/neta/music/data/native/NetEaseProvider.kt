@@ -1,5 +1,10 @@
 package io.neta.music.data.native
 
+import io.neta.music.data.AlbumDetail
+import io.neta.music.data.AlbumSummary
+import io.neta.music.data.ArtistAlbumPage
+import io.neta.music.data.ArtistDetail
+import io.neta.music.data.ArtistProfile
 import io.neta.music.data.CollectionResult
 import io.neta.music.data.ListeningMode
 import io.neta.music.data.Playlist
@@ -10,6 +15,10 @@ import io.neta.music.data.QRCreateResult
 import io.neta.music.data.QRSession
 import io.neta.music.data.Song
 import io.neta.music.data.TopList
+import io.neta.music.data.normalizePublishTime
+import io.neta.music.data.toAlbumSummary
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -68,6 +77,8 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
     private val json = NativeHttp.json
     private val urlCache = ConcurrentHashMap<String, CachedUrl>()
     private val shortLinkCache = ConcurrentHashMap<String, String>()
+    /** 音质探测结果按 cookie 缓存：探测要打十几次取流接口，不能每次进设置页都重跑。 */
+    private val availableQualityCache = ConcurrentHashMap<String, List<AudioQualityOption>>()
 
     override val supportsSearchPagination: Boolean = true
 
@@ -147,18 +158,54 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
         return if (url.isNotBlank()) song.copy(url = url) else song
     }
 
-    override suspend fun downloadUrl(cookie: String, song: Song): String = resolveStream(cookie, song).url
+    override suspend fun downloadUrl(cookie: String, song: Song, quality: AudioQuality): String =
+        resolveStream(cookie, song, quality).url
 
-    override suspend fun playableStream(cookie: String, song: Song, workDir: File): PlayableStream {
-        val stream = resolveStream(cookie, song)
+    override suspend fun playableStream(
+        cookie: String,
+        song: Song,
+        workDir: File,
+        quality: AudioQuality,
+    ): PlayableStream {
+        val stream = resolveStream(cookie, song, quality)
         return PlayableStream(stream.url, stream.ext, stream.bitrate, stream.level, preview = stream.preview, extra = stream.extra)
     }
 
-    private suspend fun resolveStream(cookie: String, song: Song): NeteaseStream {
+    /**
+     * 探测当前账号实际能选的音质档。先用一首固定的热门曲目从最高档往下探，探不到再换成搜索
+     * 结果里的前几首——单曲可能缺某一档（没上架无损、地区限制），换歌才有结论。
+     */
+    override suspend fun availableQualityOptions(cookie: String): List<AudioQualityOption> {
+        availableQualityCache[cookie]?.let { return it }
+        val probeSongs = buildList {
+            add(Song(id = NETEASE_QUALITY_PROBE_SONG_ID, source = "netease"))
+            val searched = runCatching { searchSongs(cookie, NETEASE_QUALITY_PROBE_KEYWORD) }
+                .getOrDefault(emptyList())
+                .filter { it.id != NETEASE_QUALITY_PROBE_SONG_ID }
+                .take(4)
+            addAll(searched)
+        }
+        for (song in probeSongs) {
+            for (option in NETEASE_QUALITY_LADDER.options) {
+                if (runCatching { resolveStream(cookie, song, option.value) }.isSuccess) {
+                    // 会员能力是区间：拿到高档也意味着低档可用，免得单曲低档端点一时拒绝就把低档全删掉
+                    val options = NETEASE_QUALITY_LADDER.ladderFrom(option.value)
+                    availableQualityCache[cookie] = options
+                    return options
+                }
+            }
+        }
+        availableQualityCache[cookie] = emptyList()
+        return emptyList()
+    }
+
+    private suspend fun resolveStream(cookie: String, song: Song, quality: AudioQuality): NeteaseStream {
         if (song.source != "netease") throw IllegalArgumentException("source mismatch")
         val songId = song.extra["song_id"]?.takeIf { it.isNotBlank() } ?: song.id
-        val levels = preferredLevels(song)
-        val cacheKey = "$songId:${levels.joinToString(",")}:${NativeCrypto.md5Hex(cookie)}"
+        // 指定了档位就只准那一档：拿不到报错，不静默降到 128k
+        val pinned = quality != AudioQuality.Auto && NETEASE_QUALITY_LADDER.supports(quality)
+        val levels = if (pinned) neteaseLevelsForQuality(quality) else preferredLevels(song)
+        val cacheKey = "$songId:${levels.joinToString(",")}:$quality:${NativeCrypto.md5Hex(cookie)}"
         urlCache[cacheKey]?.let { cached ->
             if (cached.expiresAt > System.currentTimeMillis()) return cached.stream
             urlCache.remove(cacheKey)
@@ -170,8 +217,12 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
         if (cookie.isNotBlank()) {
             for (level in levels) {
                 val stream = runCatching { getEapiStream(cookie, songId, level) }.getOrNull() ?: continue
+                if (pinned && !NETEASE_QUALITY_LADDER.atLeast(inferAudioQuality(stream.level, stream.ext, stream.bitrate, NETEASE_STREAM_QUALITY_BY_LEVEL), quality)) continue
                 urlCache[cacheKey] = CachedUrl(stream, System.currentTimeMillis() + CACHE_TTL_MS)
                 return stream
+            }
+            if (pinned) {
+                throw IllegalStateException("netease $quality unavailable (might be vip or copyright restricted)")
             }
         }
 
@@ -185,6 +236,8 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
                 .getOrNull()?.data?.firstOrNull() ?: continue
             val url = item.url
             if (url.isNotBlank()) {
+                // 指定高档时不允许用 128k 兜底：接口对没权限的档就是这么“降级”的
+                if (pinned && br != 320000) continue
                 val stream = NeteaseStream(
                     url = url,
                     level = "",
@@ -193,6 +246,7 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
                     preview = item.preview,
                     extra = item.volumeExtra(),
                 )
+                if (pinned && !NETEASE_QUALITY_LADDER.atLeast(inferAudioQuality(stream.level, stream.ext, stream.bitrate, NETEASE_STREAM_QUALITY_BY_LEVEL), quality)) continue
                 urlCache[cacheKey] = CachedUrl(stream, System.currentTimeMillis() + CACHE_TTL_MS)
                 return stream
             }
@@ -434,6 +488,135 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
         if (parsed.first != NeteaseLinkKind.Album) throw IllegalArgumentException("invalid netease album link")
         val (playlist, songs) = fetchAlbumDetail(cookie, parsed.second)
         return CollectionResult(playlist, songs)
+    }
+
+    /**
+     * 歌手资料：/api/v1/artist 一次给资料、完整简介和 50 首热门歌（歌曲结构和搜索结果相同）；
+     * 粉丝数、身份标签各走一个轻量接口并行取，失败就留空，不影响主体。
+     */
+    override suspend fun artistDetail(cookie: String, id: String): ArtistDetail = coroutineScope {
+        val artistId = id.trim()
+        if (artistId.isEmpty() || !artistId.all { it.isDigit() }) {
+            throw IllegalArgumentException("invalid netease artist id: $id")
+        }
+        val fans = async { runCatching { fetchArtistFans(cookie, artistId) }.getOrDefault(0L) }
+        val identity = async { runCatching { fetchArtistIdentity(cookie, artistId) }.getOrDefault("") }
+        val body = NativeHttp.get(
+            ARTIST_DETAIL_API.format(artistId),
+            headers = mapOf("Referer" to REFERER),
+            cookie = cookie,
+            randomIp = true,
+        )
+        val detail = parseArtistDetail(body)
+        val facts = identity.await().takeIf { it.isNotBlank() }?.let { listOf("身份" to it) }.orEmpty()
+        detail.copy(profile = detail.profile.copy(fans = fans.await(), facts = facts))
+    }
+
+    internal fun parseArtistDetail(body: String): ArtistDetail {
+        val data = json.decodeFromString<NeteaseArtistDetailResponse>(body)
+        if (data.code != 200) throw IllegalStateException("netease api error code: ${data.code}")
+        val artist = data.artist ?: throw IllegalStateException("netease artist not found")
+        val alias = (listOf(artist.trans) + artist.alias)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it != artist.name }
+            .distinct()
+            .joinToString(" / ")
+        // 没有照片的歌手给的是网易的默认灰图，当没有处理
+        val picture = artist.picUrl.ifBlank { artist.img1v1Url }
+            .takeUnless { it.isBlank() || it.contains(NETEASE_DEFAULT_ARTIST_PIC) }
+            .orEmpty()
+        val profile = ArtistProfile(
+            id = artist.id.toString(),
+            name = artist.name,
+            source = "netease",
+            avatar = if (picture.isEmpty()) "" else neteaseImageAt(picture, ARTIST_AVATAR_SIZE),
+            alias = alias,
+            description = artistPlainText(artist.briefDesc),
+            songCount = artist.musicSize,
+            albumCount = artist.albumSize,
+            mvCount = artist.mvSize,
+            link = "https://music.163.com/#/artist?id=${artist.id}",
+        )
+        val hotSongs = data.hotSongs.map { item ->
+            val song = songOf(item)
+            if (item.al.id <= 0) {
+                song
+            } else {
+                val albumId = item.al.id.toString()
+                song.copy(albumId = albumId, extra = song.extra + ("album_id" to albumId))
+            }
+        }
+        return ArtistDetail(profile, hotSongs)
+    }
+
+    private suspend fun fetchArtistFans(cookie: String, artistId: String): Long {
+        val body = NativeHttp.get(
+            "$ARTIST_FANS_API?id=$artistId",
+            headers = mapOf("Referer" to REFERER),
+            cookie = cookie,
+            randomIp = true,
+        )
+        val root = json.parseToJsonElement(body).jsonObject
+        if (root.int("code") != 200) return 0L
+        return (root["data"] as? JsonObject)?.long("fansCnt") ?: 0L
+    }
+
+    /** 歌手主页头部的身份标签：“歌手、作词、作曲、编曲、制作人”。 */
+    private suspend fun fetchArtistIdentity(cookie: String, artistId: String): String {
+        val body = NativeHttp.get(
+            "$ARTIST_HEAD_API?id=$artistId",
+            headers = mapOf("Referer" to REFERER),
+            cookie = cookie,
+            randomIp = true,
+        )
+        val root = json.parseToJsonElement(body).jsonObject
+        if (root.int("code") != 200) return ""
+        val identify = (root["data"] as? JsonObject)?.get("identify") as? JsonObject ?: return ""
+        return identify.string("imageDesc").trim()
+    }
+
+    /** 歌手专辑，接口本身按发行时间从新到旧；artist.albumSize 是总数。 */
+    override suspend fun artistAlbums(cookie: String, id: String, page: Int, limit: Int): ArtistAlbumPage {
+        val artistId = id.trim()
+        if (artistId.isEmpty() || !artistId.all { it.isDigit() }) {
+            throw IllegalArgumentException("invalid netease artist id: $id")
+        }
+        val size = limit.coerceIn(1, 100)
+        val offset = (page.coerceAtLeast(1) - 1) * size
+        val body = NativeHttp.get(
+            ARTIST_ALBUMS_API.format(artistId) + "?offset=$offset&limit=$size&total=true",
+            headers = mapOf("Referer" to REFERER),
+            cookie = cookie,
+            randomIp = true,
+        )
+        return parseArtistAlbums(body, artistId)
+    }
+
+    internal fun parseArtistAlbums(body: String, artistId: String): ArtistAlbumPage {
+        val data = json.decodeFromString<NeteaseArtistAlbumsResponse>(body)
+        if (data.code != 200) throw IllegalStateException("netease api error code: ${data.code}")
+        val albums = data.hotAlbums.filter { it.id > 0 }.map { item ->
+            AlbumSummary(
+                id = item.id.toString(),
+                name = item.name,
+                source = "netease",
+                cover = item.picUrl,
+                artist = item.artist.name.ifBlank { item.artists.joinToString(", ") { it.name } },
+                artistId = artistId,
+                publishTime = normalizePublishTime(item.publishTime.toString()),
+                type = neteaseAlbumType(item.type, item.subType),
+                trackCount = item.size,
+                company = item.company.trim(),
+                description = artistPlainText(item.description.ifBlank { item.briefDesc }),
+                link = "https://music.163.com/#/album?id=${item.id}",
+            )
+        }
+        return ArtistAlbumPage(albums = albums, total = data.artist?.albumSize ?: 0, hasMore = data.more)
+    }
+
+    override suspend fun albumDetail(cookie: String, id: String): AlbumDetail {
+        val (playlist, songs) = fetchAlbumDetail(cookie, id)
+        return AlbumDetail(playlist.toAlbumSummary(), songs)
     }
 
     override suspend fun categories(cookie: String): List<PlaylistCategory> {
@@ -873,11 +1056,16 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
             description = description,
             source = "netease",
             link = "https://music.163.com/#/album?id=${album.id}",
-            extra = mapOf(
-                "type" to "album",
-                "company" to album.company,
-                "publish_time" to album.publishTime.toString(),
-            ),
+            extra = buildMap {
+                put("type", "album")
+                put("company", album.company)
+                put("publish_time", album.publishTime.toString())
+                // 专辑页的歌手入口、“更多专辑”用
+                val artistId = album.artist.id.takeIf { it > 0 } ?: album.artists.firstOrNull { it.id > 0 }?.id
+                if (artistId != null) put("artist_id", artistId.toString())
+                val albumType = neteaseAlbumType(album.type, album.subType)
+                if (albumType.isNotEmpty()) put("album_type", albumType)
+            },
         )
         val songs = data.songs.map { item ->
             val size = when {
@@ -1015,6 +1203,8 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
     }
 
     internal fun parseNeteaseLink(link: String): Pair<NeteaseLinkKind, String>? {
+        // 直接输入的纯数字歌单 ID（导入入口用），当作歌单 ID 解析
+        if (link.isNotEmpty() && link.all { it in '0'..'9' }) return NeteaseLinkKind.Playlist to link
         val candidates = mutableListOf<String>()
         // 分享文本（“分享单曲《…》: https://… （来自网易云音乐）”）里先取出其中的链接
         NETEASE_URL_PATTERN.find(link)?.value
@@ -1120,6 +1310,13 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         const val ARTIST_SONGS_API = "https://music.163.com/weapi/v1/artist/songs"
         const val ARTIST_SONG_LIMIT = 500
+        const val ARTIST_DETAIL_API = "https://music.163.com/api/v1/artist/%s"
+        const val ARTIST_ALBUMS_API = "https://music.163.com/api/artist/albums/%s"
+        const val ARTIST_FANS_API = "https://music.163.com/api/artist/follow/count/get"
+        const val ARTIST_HEAD_API = "https://music.163.com/api/artist/head/info/get"
+        const val ARTIST_AVATAR_SIZE = 800
+        /** 没有照片的歌手 picUrl 指向的默认灰图。 */
+        const val NETEASE_DEFAULT_ARTIST_PIC = "5639395138885805"
         const val DOWNLOAD_API = "http://music.163.com/weapi/song/enhance/player/url"
         const val DOWNLOAD_EAPI = "https://interface3.music.163.com/eapi/song/enhance/player/url/v1"
         const val DETAIL_API = "https://music.163.com/weapi/v3/song/detail"
@@ -1148,8 +1345,77 @@ class NetEaseProvider : BaseNativeProvider(NETEASE_INFO) {
     }
 }
 
+/** 网易云图片按边长裁成正方形：已有 param 就换掉，没有就加在查询串里。 */
+internal fun neteaseImageAt(url: String, size: Int): String {
+    val param = "param=${size}y$size"
+    val existing = Regex("""([?&])param=\d+y\d+""").find(url)
+    if (existing != null) return url.replaceRange(existing.range, existing.groupValues[1] + param)
+    return url + (if (url.contains('?')) "&" else "?") + param
+}
+
+/** 专辑类型：type 是 专辑 / Single / EP，subType 是 录音室版 / 现场版 / 混音版…，录音室版不另外标。 */
+internal fun neteaseAlbumType(type: String, subType: String): String {
+    val main = type.trim()
+    val sub = subType.trim()
+    return when {
+        sub.isEmpty() || sub == "录音室版" -> main
+        main.isEmpty() -> sub
+        else -> "$main · $sub"
+    }
+}
+
 /** 取流档位从高到低：母带 > 沉浸环绕 > 高清环绕 > Hi-Res > 无损 > 极高。 */
-internal val NETEASE_LEVEL_ORDER = listOf("jymaster", "sky", "jyeffect", "hires", "lossless", "exhigh")
+internal val NETEASE_LEVEL_ORDER =listOf("jymaster", "sky", "jyeffect", "hires", "lossless", "exhigh")
+
+/** 探测账号音质权限用的固定曲目与关键词。 */
+private const val NETEASE_QUALITY_PROBE_SONG_ID = "496869422"
+private const val NETEASE_QUALITY_PROBE_KEYWORD = "周杰伦"
+
+/**
+ * 网易云的可选音质档，从高到低。档名与 [NETEASE_LEVEL_ORDER] 是一套：阶梯给界面和
+ * 「有没有降档」判断用，档名给取流接口用。移植自 music-lib 的 netease/quality.go。
+ */
+internal val NETEASE_QUALITY_LADDER: AudioQualityLadder = AudioQualityLadder.of(
+    listOf(
+        AudioQualityOption(AudioQuality.Master, "超清母带", "wav", vip = true),
+        AudioQualityOption(AudioQuality.Spatial, "沉浸环绕声", "flac", vip = true),
+        AudioQualityOption(AudioQuality.Vivid, "臻音全景声", "mp3", vip = true),
+        AudioQualityOption(AudioQuality.Atmos, "杜比全景声", "flac", vip = true),
+        AudioQualityOption(AudioQuality.HiRes, "Hi-Res 无损", "flac", vip = true),
+        AudioQualityOption(AudioQuality.Lossless, "无损音质", "flac", vip = true),
+        AudioQualityOption(AudioQuality.High, "高品质 320k", "mp3", 320),
+        AudioQualityOption(AudioQuality.Higher, "较高品质 192k", "mp3", 192),
+        AudioQualityOption(AudioQuality.Standard, "标准音质 128k", "mp3", 128),
+    ),
+)
+
+/** 音质档 → 取流档位。一档可能对应多个档名（sky 与 jyeffect 都是沉浸环绕声）。 */
+internal fun neteaseLevelsForQuality(quality: AudioQuality): List<String> = when (quality) {
+    AudioQuality.Master -> listOf("jymaster")
+    AudioQuality.Spatial -> listOf("sky", "jyeffect")
+    AudioQuality.Vivid -> listOf("vivid")
+    AudioQuality.Atmos -> listOf("dolby")
+    AudioQuality.HiRes -> listOf("hires")
+    AudioQuality.Lossless -> listOf("lossless")
+    AudioQuality.High -> listOf("exhigh")
+    AudioQuality.Higher -> listOf("higher")
+    AudioQuality.Standard -> listOf("standard")
+    else -> emptyList()
+}
+
+/** 取回来的流实际是哪一档：接口回的 level 优先，退回按格式+码率推断。 */
+private val NETEASE_STREAM_QUALITY_BY_LEVEL = mapOf(
+    "jymaster" to AudioQuality.Master,
+    "sky" to AudioQuality.Spatial,
+    "jyeffect" to AudioQuality.Spatial,
+    "vivid" to AudioQuality.Vivid,
+    "dolby" to AudioQuality.Atmos,
+    "hires" to AudioQuality.HiRes,
+    "lossless" to AudioQuality.Lossless,
+    "exhigh" to AudioQuality.High,
+    "higher" to AudioQuality.Higher,
+    "standard" to AudioQuality.Standard,
+)
 
 /**
  * 取流尝试的档位序列：从歌曲标注的最高档开始逐级下探到 exhigh。
@@ -1256,7 +1522,53 @@ private data class NeteaseSearchSong(
 )
 
 @Serializable
-private data class NeteaseArtist(val name: String = "")
+private data class NeteaseArtist(val name: String = "", val id: Long = 0)
+
+@Serializable
+private data class NeteaseArtistDetailResponse(
+    val code: Int = 0,
+    val artist: NeteaseArtistInfo? = null,
+    val hotSongs: List<NeteaseSearchSong> = emptyList(),
+    val more: Boolean = false,
+)
+
+@Serializable
+private data class NeteaseArtistInfo(
+    val id: Long = 0,
+    val name: String = "",
+    val picUrl: String = "",
+    val img1v1Url: String = "",
+    val briefDesc: String = "",
+    val trans: String = "",
+    val alias: List<String> = emptyList(),
+    val musicSize: Int = 0,
+    val albumSize: Int = 0,
+    val mvSize: Int = 0,
+)
+
+@Serializable
+private data class NeteaseArtistAlbumsResponse(
+    val code: Int = 0,
+    val artist: NeteaseArtistInfo? = null,
+    val hotAlbums: List<NeteaseArtistAlbum> = emptyList(),
+    val more: Boolean = false,
+)
+
+@Serializable
+private data class NeteaseArtistAlbum(
+    val id: Long = 0,
+    val name: String = "",
+    val picUrl: String = "",
+    val size: Int = 0,
+    val company: String = "",
+    val description: String = "",
+    val briefDesc: String = "",
+    val publishTime: Long = 0,
+    val type: String = "",
+    val subType: String = "",
+    val artist: NeteaseArtist = NeteaseArtist(),
+    val artists: List<NeteaseArtist> = emptyList(),
+)
 
 @Serializable
 private data class NeteaseAlbum(
@@ -1457,6 +1769,8 @@ private data class NeteaseAlbumDetail(
     val publishTime: Long = 0,
     val artist: NeteaseArtist = NeteaseArtist(),
     val artists: List<NeteaseArtist> = emptyList(),
+    val type: String = "",
+    val subType: String = "",
 )
 
 @Serializable

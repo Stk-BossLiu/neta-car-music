@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Lyrics
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.QrCode2
@@ -70,6 +71,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -117,7 +119,10 @@ import io.neta.music.aggregate.MatchStrictness
 import io.neta.music.aggregate.PlaybackMode
 import io.neta.music.data.CrossfadeAnimation
 import io.neta.music.data.CrossfadeMode
+import io.neta.music.data.native.AudioQuality
 import io.neta.music.data.ProviderInfo
+import io.neta.music.data.lx.LxPlatform
+import io.neta.music.data.lx.LxSources
 import io.neta.music.data.playreport.PlayReportHub
 import io.neta.music.ui.AccountProfile
 import io.neta.music.ui.Cover
@@ -539,6 +544,10 @@ private fun StyleChips(label: String, selected: SchemeStyle, onSelect: (SchemeSt
 
 // ======================= 播放与换源 =======================
 
+/** 音质偏好只放常用档；母带、全景声这些档取决于平台和账号，不在这里露出来。 */
+private val QUALITY_PREFERENCE_OPTIONS =
+    listOf(AudioQuality.Auto, AudioQuality.Standard, AudioQuality.High, AudioQuality.Lossless, AudioQuality.HiRes)
+
 /** 播放与换源：换源模式按钮组、平台顺序入口、匹配选项。 */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -551,7 +560,10 @@ internal fun PlaybackSettingsScreen(
 ) {
     val aggregation = state.aggregation
     val searchable = state.providers.filter { it.search }
-    val priority = aggregation.priorityFor(searchable.map { it.id })
+    val lxRecords by LxSources.records.collectAsState()
+    val lxProvider = ProviderInfo(id = LxPlatform.PROVIDER_ID, name = LxPlatform.PROVIDER_NAME)
+    val pinnable = searchable + listOfNotNull(lxProvider.takeIf { lxRecords.isNotEmpty() })
+    val priority = aggregation.priorityFor(searchable.map { it.id } + LxPlatform.PROVIDER_ID)
     SettingsPage(SettingsSection.Playback, embedded, onBack) {
         item(key = "startupHead", contentType = "sectionHeader") { SectionLabel("启动播放") }
         item(key = "autoPlayOnLaunch", contentType = "switch") {
@@ -564,6 +576,30 @@ internal fun PlaybackSettingsScreen(
                 summary = "打开应用后，从上次的歌曲和进度继续播放",
                 icon = Icons.Filled.MusicNote,
             )
+        }
+        item(key = "autoLyricsHead", contentType = "sectionHeader") { SectionLabel("自动进入歌词页") }
+        item(key = "autoLyricsSwitch", contentType = "switch") {
+            SwitchRow(
+                title = "自动进入歌词页",
+                checked = state.autoLyricsIdle,
+                onCheckedChange = actions::setAutoLyricsIdle,
+                index = 0,
+                count = 1,
+                summary = "播放中在主界面长时间不操作，或在主界面上开始播放（方向盘、语音这类控制也一样）时，自动打开歌词页",
+                icon = Icons.Filled.Lyrics,
+            )
+        }
+        if (state.autoLyricsIdle) {
+            item(key = "autoLyricsSecondsHead", contentType = "sectionHeader") { SectionLabel("无操作时长") }
+            item(key = "autoLyricsSeconds", contentType = "toggleGroup") {
+                ConnectedToggleGroup(
+                    options = listOf(15, 30, 60, 120),
+                    selected = state.autoLyricsIdleSeconds,
+                    onSelect = { actions.setAutoLyricsIdleSeconds(it) },
+                    label = { if (it >= 60) "${it / 60} 分钟" else "$it 秒" },
+                    modifier = Modifier.widthIn(max = 480.dp).fillMaxWidth(),
+                )
+            }
         }
         item(key = "crossHead", contentType = "sectionHeader") { SectionLabel("切歌过渡") }
         item(key = "crossSwitch", contentType = "switch") {
@@ -649,6 +685,22 @@ internal fun PlaybackSettingsScreen(
                 }
             }
         }
+        item(key = "qualityHead", contentType = "sectionHeader") { SectionLabel("播放音质") }
+        item(key = "quality", contentType = "toggleGroup") {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                ConnectedToggleGroup(
+                    options = QUALITY_PREFERENCE_OPTIONS,
+                    selected = AudioQuality.normalize(state.audioQuality) ?: AudioQuality.Auto,
+                    onSelect = { actions.setAudioQuality(it) },
+                    label = { it.preferenceLabel },
+                    modifier = Modifier.widthIn(max = 480.dp).fillMaxWidth(),
+                )
+                SettingsNote(
+                    "锁了档位就只取那一档；平台给不了（没上架、账号没有会员）时先换平台，仍不行才退回自动档。" +
+                        "各平台能选哪些档取决于当前账号，Spotify 与 Apple Music 只有试听片段。",
+                )
+            }
+        }
         item(key = "modeHead", contentType = "sectionHeader") { SectionLabel("换源模式") }
         item(key = "mode", contentType = "toggleGroup") {
             ConnectedToggleGroup(
@@ -658,8 +710,8 @@ internal fun PlaybackSettingsScreen(
                 label = {
                     when (it) {
                         PlaybackMode.Auto -> "自动"
-                        PlaybackMode.Priority -> "优先平台"
-                        PlaybackMode.Pinned -> "固定平台"
+                        PlaybackMode.Priority -> "优先音源"
+                        PlaybackMode.Pinned -> "固定音源"
                     }
                 },
                 modifier = Modifier.widthIn(max = 480.dp).fillMaxWidth(),
@@ -675,17 +727,17 @@ internal fun PlaybackSettingsScreen(
             )
         }
         if (aggregation.playbackMode == PlaybackMode.Pinned) {
-            item(key = "pinHead", contentType = "sectionHeader") { SectionLabel("固定平台") }
+            item(key = "pinHead", contentType = "sectionHeader") { SectionLabel("固定音源") }
             item(key = "pin", contentType = "chips") {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    searchable.forEach { provider ->
+                    pinnable.forEach { provider ->
                         MusicChip(provider.name, aggregation.pinnedProvider == provider.id) { actions.setPinnedProvider(provider.id) }
                     }
                 }
             }
         }
         item(key = "priorityHead", contentType = "sectionHeader") {
-            SectionLabel("平台顺序") {
+            SectionLabel("音源顺序") {
                 Text("越靠前越先尝试", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
@@ -761,9 +813,15 @@ internal fun orderedEnabledSources(providers: List<ProviderInfo>, enabledIds: Li
 internal fun SourcesSettingsScreen(state: MusicUiState, actions: MusicActions, onBack: () -> Unit, embedded: Boolean = false) {
     val tv = LocalAppWindow.current.isTv
     val searchable = state.providers.filter { it.search }
-    val enabledIds = state.aggregation.enabledOrDefault(searchable.map { it.id })
-    val enabled = orderedEnabledSources(searchable, enabledIds)
-    val disabled = searchable.filterNot { it.id in enabledIds }
+    val lxRecords by LxSources.records.collectAsState()
+    val orderable = searchable + ProviderInfo(
+        id = LxPlatform.PROVIDER_ID,
+        name = LxPlatform.PROVIDER_NAME,
+        note = if (lxRecords.isEmpty()) "尚未添加脚本" else "${lxRecords.count { it.enabled }} 个启用脚本 · 内部顺序在自定义音源中调整",
+    )
+    val enabledIds = state.aggregation.enabledOrDefault(orderable.map { it.id })
+    val enabled = orderedEnabledSources(orderable, enabledIds)
+    val disabled = orderable.filterNot { it.id in enabledIds }
     SettingsPage(SettingsSection.Sources, embedded, onBack) {
         item(key = "enabledHead", contentType = "sectionHeader") {
             SectionLabel("已启用") {
@@ -1072,6 +1130,7 @@ fun AccountsSettingsScreen(state: MusicUiState, actions: MusicActions, onBack: (
     LaunchedEffect(Unit) { actions.refreshAccountProfiles() }
     var cookieFor by remember { mutableStateOf<ProviderInfo?>(null) }
     var qrFor by remember { mutableStateOf<ProviderInfo?>(null) }
+    var passwordFor by remember { mutableStateOf<ProviderInfo?>(null) }
     var signerOpen by remember { mutableStateOf(false) }
     val providers = state.providers
     val loggedCount = providers.count { !state.cookies[it.id].isNullOrBlank() }
@@ -1105,6 +1164,7 @@ fun AccountsSettingsScreen(state: MusicUiState, actions: MusicActions, onBack: (
                     tv = tv,
                     onQr = { qrFor = provider },
                     onCookie = { cookieFor = provider },
+                    onPassword = { passwordFor = provider },
                     onLogout = { actions.logout(provider.id) },
                 )
             }
@@ -1136,8 +1196,8 @@ fun AccountsSettingsScreen(state: MusicUiState, actions: MusicActions, onBack: (
         item(key = "note", contentType = "note") {
             Box(Modifier.padding(top = 16.dp)) {
                 InfoNote(
-                    if (tv) "不支持扫码的平台请在手机或平板上登录。"
-                    else "能否扫码以平台接口为准；不支持扫码的平台可以粘贴 Cookie。",
+                    if (tv) "电视上可扫码登录；支持账号密码的平台直接用遥控器输入即可。"
+                    else "能否扫码以平台接口为准；支持账号密码的平台点“登录”输入用户名和密码。",
                 )
             }
         }
@@ -1181,6 +1241,19 @@ fun AccountsSettingsScreen(state: MusicUiState, actions: MusicActions, onBack: (
             onDismiss = { cookieFor = null },
         )
     }
+    passwordFor?.let { provider ->
+        PasswordLoginDialog(
+            provider = provider,
+            state = state,
+            onDismiss = {
+                actions.cancelLogin()
+                passwordFor = null
+            },
+            onSubmit = { username, password ->
+                actions.loginWithPassword(provider.id, username, password)
+            },
+        )
+    }
 }
 
 @Composable
@@ -1193,6 +1266,7 @@ private fun AccountRow(
     tv: Boolean,
     onQr: () -> Unit,
     onCookie: () -> Unit,
+    onPassword: () -> Unit,
     onLogout: () -> Unit,
 ) {
     // 已登录且拿到资料时展示账号卡片：头像、昵称、会员/等级；拿不到资料就保持原来的平台行
@@ -1202,6 +1276,8 @@ private fun AccountRow(
             val info = profile?.let { p -> listOf(p.nickname, p.detail).filter { it.isNotBlank() }.joinToString(" · ") }.orEmpty()
             info.ifBlank { "已登录" }
         }
+        !provider.loginRequired -> "无需登录"
+        provider.passwordLogin -> "未登录 · 用户名密码"
         provider.qrLogin -> "未登录"
         tv -> "未登录 · 请在手机上登录"
         else -> "未登录 · 仅支持 Cookie"
@@ -1210,7 +1286,11 @@ private fun AccountRow(
         title = provider.name,
         index = index,
         count = count,
-        onClick = if (tv) null else onCookie,
+        onClick = when {
+            provider.passwordLogin -> onPassword
+            tv || !provider.loginRequired -> null
+            else -> onCookie
+        },
         leading = {
             if (loggedIn && avatar.isNotBlank()) {
                 AsyncImage(
@@ -1230,15 +1310,38 @@ private fun AccountRow(
                 loggedIn -> TextButton(onClick = onLogout, modifier = Modifier.tvFocusRing(CircleShape)) {
                     Text("退出", Modifier.semantics { contentDescription = "退出${provider.name}" }, color = MaterialTheme.colorScheme.error)
                 }
+                provider.passwordLogin -> FilledTonalButton(onClick = onPassword, modifier = Modifier.tvFocusRing(CircleShape)) {
+                    Text("登录", Modifier.semantics { contentDescription = "登录${provider.name}" })
+                }
                 provider.qrLogin -> FilledTonalButton(onClick = onQr, modifier = Modifier.tvFocusRing(CircleShape)) {
                     Icon(Icons.Filled.QrCode2, null, Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("登录", Modifier.semantics { contentDescription = "扫码登录${provider.name}" })
                 }
-                !tv -> FilledTonalButton(onClick = onCookie) { Text("Cookie", Modifier.semantics { contentDescription = "用 Cookie 登录${provider.name}" }) }
+                provider.loginRequired && !tv -> FilledTonalButton(onClick = onCookie) { Text("Cookie", Modifier.semantics { contentDescription = "用 Cookie 登录${provider.name}" }) }
             }
         },
     )
+}
+
+/**
+ * 一条扫码通道：[type] 传给平台层（QQ 的 "" 是 QQ 扫码、"wx" 是微信扫码），其余给界面。
+ */
+private data class QrChannel(val type: String, val label: String, val subtitle: String)
+
+/**
+ * QQ 的会员可能挂在 QQ 号、也可能挂在微信号上（同一个 QQ 音乐账号两种登录方式都认），
+ * 所以这里给两条扫码通道；其他平台只有默认一条。
+ *
+ * 微信放第一位：QQ 那条走 ptlogin2 三方登录，现在上游拿不到有效的设备风控参数，
+ * 二维码扫了也确认不了（ptqrlogin 直接 403），默认给一条能用的。
+ */
+private fun qrLoginChannels(provider: ProviderInfo): List<QrChannel> = when (provider.id) {
+    "qq" -> listOf(
+        QrChannel("wx", "微信 扫码", "用微信扫描二维码，并在手机上确认登录"),
+        QrChannel("", "QQ 扫码", "用 QQ 扫描二维码，并在手机上确认登录"),
+    )
+    else -> listOf(QrChannel("", "扫码登录", "用${provider.name} App 扫描二维码，并在手机上确认登录"))
 }
 
 /** 扫码登录：手机是底部面板，平板和电视是居中对话框（电视二维码放大，方便在沙发上扫）。 */
@@ -1251,8 +1354,9 @@ private fun QrLoginPanel(
     onDismiss: () -> Unit,
 ) {
     val window = LocalAppWindow.current
-    val type = ""
-    SideEffect(provider.id, actions) { actions.startQrLogin(provider.id, type) }
+    val channels = remember(provider.id) { qrLoginChannels(provider) }
+    var type by remember(provider.id) { mutableStateOf(channels.first().type) }
+    SideEffect(provider.id, type, actions) { actions.startQrLogin(provider.id, type) }
     // 面板不经 onDismiss 离开组合时（旋转屏幕、窗口尺寸变化，qrFor 不会保存）也要停掉轮询
     DisposableEffect(provider.id) { onDispose { actions.cancelLogin() } }
     // 登录成功后 Cookie 会变，变了就关闭
@@ -1262,11 +1366,12 @@ private fun QrLoginPanel(
         if (cookie.isNotBlank() && cookie != initialCookie) onDismiss()
     }
     val title = "扫码登录${provider.name}"
-    val subtitle = "用${provider.name} App 扫描二维码，并在手机上确认登录"
+    val subtitle = channels.firstOrNull { it.type == type }?.subtitle
+        ?: "用${provider.name} App 扫描二维码，并在手机上确认登录"
     val refresh = { actions.startQrLogin(provider.id, type) }
     if (window.isPhone) {
         AdaptiveSheet(onDismiss = onDismiss, title = title, subtitle = subtitle) {
-            QrLoginBody(provider, state, refresh, onCookie)
+            QrLoginBody(provider, state, channels, type, { type = it }, refresh, onCookie)
         }
         return
     }
@@ -1290,7 +1395,7 @@ private fun QrLoginPanel(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                QrLoginBody(provider, state, refresh, onCookie)
+                QrLoginBody(provider, state, channels, type, { type = it }, refresh, onCookie)
             }
         }
     }
@@ -1301,6 +1406,9 @@ private fun QrLoginPanel(
 private fun QrLoginBody(
     provider: ProviderInfo,
     state: MusicUiState,
+    channels: List<QrChannel>,
+    type: String,
+    onTypeChange: (String) -> Unit,
     onRefresh: () -> Unit,
     onCookie: (() -> Unit)?,
 ) {
@@ -1317,6 +1425,21 @@ private fun QrLoginBody(
     val refreshFocus = remember { FocusRequester() }
     SettingsTvFocus(refreshFocus, ended)
     Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        // 通道不止一条时才给选择；切通道会重新取码，微信那条要用微信扫
+        if (channels.size > 1) {
+            Row(
+                Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+            ) {
+                channels.forEach { channel ->
+                    MusicChip(
+                        channel.label,
+                        type == channel.type,
+                        description = "扫码登录${provider.name}：${channel.label}",
+                    ) { onTypeChange(channel.type) }
+                }
+            }
+        }
         Box(
             Modifier
                 .size(qrSize)
@@ -1438,12 +1561,88 @@ private fun CookieDialog(provider: ProviderInfo, initial: String, onSave: (Strin
     )
 }
 
+/** 用户名 + 密码登录；成功后 Cookie 变化，面板自动关闭。 */
+@Composable
+private fun PasswordLoginDialog(
+    provider: ProviderInfo,
+    state: MusicUiState,
+    onDismiss: () -> Unit,
+    onSubmit: (String, String) -> Unit,
+) {
+    var username by remember(provider.id) { mutableStateOf("") }
+    var password by remember(provider.id) { mutableStateOf("") }
+    val cookie = state.cookies[provider.id].orEmpty()
+    val initialCookie = remember(provider.id) { cookie }
+    SideEffect(provider.id, cookie, initialCookie) {
+        if (cookie.isNotBlank() && cookie != initialCookie) onDismiss()
+    }
+    val active = state.loginProviderId == provider.id
+    val status = if (active) state.loginStatus else ""
+    val busy = status == "登录中…"
+    val error = status.takeIf { it.startsWith("登录失败") }.orEmpty()
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = {
+            DialogAvoidsFold()
+            Text("登录${provider.name}")
+        },
+        text = {
+            Column {
+                Text(
+                    "使用 music.op.wiki 的账号；没有账号请先在网站上注册。登录后可以同步自己的歌单。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                    label = { Text("用户名") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    label = { Text("密码") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Password,
+                    ),
+                )
+                if (error.isNotBlank()) {
+                    Text(
+                        error.removePrefix("登录失败："),
+                        modifier = Modifier.padding(top = 8.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSubmit(username, password) },
+                enabled = username.isNotBlank() && password.isNotBlank() && !busy,
+            ) { Text(if (busy) "登录中…" else "登录") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !busy) { Text("取消") }
+        },
+    )
+}
+
 /** 个别平台的 Cookie 有固定格式，按平台给提示；没有特殊要求的用通用说明。 */
 private fun cookieHint(provider: ProviderInfo): String = when (provider.id) {
     // Apple 的歌词在 /songs/{id}/lyrics 子资源上，只有带 media-user-token 才返回；
     // 商店还要和歌曲所属目录一致，中国区账号需要显式声明 storefront。
     "apple" -> "粘贴 Apple Music 网页版的 Cookie，必须包含 media-user-token，否则拿不到歌词。" +
         "多个字段用分号隔开；账号是中国区的话再加 storefront=cn，否则按美区目录检索和取歌词。"
+    // 私人歌单和账号资料靠 SAPISIDHASH 鉴权，缺 SAPISID 就只剩公开内容。
+    "youtubemusic" -> "粘贴 music.youtube.com 的完整 Cookie，必须包含 SAPISID 或 __Secure-3PAPISID。" +
+        "不登录也能搜索、播放和看公开歌单；登录后才会出现你的私人歌单。"
+    "mhub" -> "建议用用户名密码登录；这里也可以粘贴 mhub_session=... 的会话 Cookie。"
     else -> "只保存在本机，换源与 VIP 检测会使用它。留空保存等于退出登录。"
 }
 
@@ -1785,8 +1984,12 @@ private const val FOLIA_MIT_NOTICE =
 fun LicensesScreen(onBack: () -> Unit, embedded: Boolean = false) {
     val openUri = rememberOpenUri()
     val thirdParty = listOf(
-        "music-lib" to "平台能力来源。当前纳入 commit 7cc4467，保留 Go 源码用于移植参考与许可证说明。",
+        "music-lib" to "平台能力来源。当前纳入 commit 90b2942，保留 Go 源码用于移植参考与许可证说明。",
         "music-lib / Kotlin 移植" to "使用 OkHttp、原生加密工具与 Kotlin 实现，不引入 GoMobile、AAR 或额外后端。",
+        "music-lib / Spotify" to "Spotify 平台的匿名 Web Player 检索、公开嵌入与榜单镜像兜底、Web API 客户端凭据流程均移植自 music-lib 的 spotify 包（AGPL-3.0）。",
+        "music-lib / 音质阶梯" to "各平台的可选音质档位、码率标签与「不静默降档」判定移植自 music-lib 的 model/quality.go 与各平台 quality.go（AGPL-3.0）。",
+        "MHub / music.op.wiki" to "多平台兜底搜索与 YouTube Music 的音频准备接口来源：MHub 公开实例（AGPL-3.0）。应用只调用它的 HTTP API，不打包其代码；音频由服务端逐首准备，客户端按它的限流要求串行请求。",
+        "Lyricon / 词幕" to "使用官方 Provider / Subscriber SDK 0.1.70 与本机词幕服务互通歌曲、歌词和播放状态（Apache-2.0）。",
         "SodaM / libresoda" to "汽水签名服务协议（POST /sign、GET /config、x-helios / x-medusa）、取流链路与加密流解密逻辑的来源（AGPL-3.0）。应用默认连接 SodaM 的公共签名服务，可在设置里换成自建实例。",
         "AndroidX、Media3、Coil、Room、WorkManager" to "均按其 Apache-2.0 或对应开源许可使用；完整列表随应用和仓库提供。",
         "二维码生成" to "扫码登录的二维码按 Nayuki QR Code generator（MIT）的算法在本机生成。",
@@ -1871,8 +2074,9 @@ fun PrivacyScreen(onBack: () -> Unit, embedded: Boolean = false) {
         "留在本机" to "最近播放、下载文件、播放进度和匹配缓存只保存在设备上。同步令牌和 WebDAV 密码使用 Android Keystore 加密，只保存在本机。",
         "本地音乐" to "扫描只读音频文件，不读图片和视频，也不改动文件本身；封面缓存和扫描记录只存在本机，匹配结果也只存在本机，除非这首歌加进了已同步的歌单或喜欢（见下）。自动匹配时，有标签的歌把歌名和歌手发给已启用平台的搜索；没有标签的截取 3 秒、降到 8 kHz 单声道算成指纹，只把指纹发给网易云音乐的听歌识曲，音频本身不离开设备。加进已同步歌单或喜欢的本地歌，同步文件里只有这些：歌名、歌手、专辑、时长、文件名、文件指纹、文件所在设备的名字、云端副本的位置和匹配结果（匹配到哪个平台的哪首歌）。不包含文件路径、音频、歌词和封面图片，也不包含播放地址和 WebDAV 密码。音频文件只在你点了上传时才会传出去：选网易云盘就传到你自己的网易云盘，选 WebDAV 就传到你自己的服务器；传的是原文件，默认只在 Wi-Fi 下传。把只在本机的歌加进已同步的歌单时只会提醒一句，从不自动上传。QQ 音乐云盘只读取列表、播放已匹配的歌，不会往里上传。",
         "歌词背景音频分析" to "“律动”只分析 ExoPlayer 已解码、正在输出的 PCM，不读取麦克风，不申请录音权限，也不保存或上传音频及频谱。暂停或离开播放页后停止分析。",
+        "词幕歌词互通" to "“发送歌词到词幕”默认开启，把当前歌曲名、歌手、歌词和播放进度通过本机的词幕核心服务提供给其他应用；不包含音频、Cookie、令牌或播放地址。“接收其他播放器歌词”默认关闭，开启后只在本机显示词幕收到的歌曲和歌词。两项均可在设置 › 播放页关闭，数据不经本项目的服务器。",
         "写入你选择的云端" to "启用同步后，自建歌单、收藏和平台账号 Cookie 会写入你的 GitHub Gist、Gitee 代码片段或 WebDAV 目录。Cookie 以明文保存，请勿公开文件链接或共享该目录；同步文件不包含同步令牌、WebDAV 密码、播放地址和下载文件。选 WebDAV 时，同步文件写在你的 WebDAV 目录里；WebDAV 密码只存在本机，不进同步文件。",
-        "网络请求" to "音乐平台接口和同步服务直接请求对应平台；更新清单与 APK 通过随应用配置的 CDN 镜像获取，没有本项目自建中转服务器。汽水播放签名器默认使用 SodaM 的公共签名服务（可在设置里关闭或换成自建实例），会员整曲的取流请求会带着 Cookie 和完整请求头发给该服务。第三方仍会看到其服务所需的常规请求信息。扫码登录的二维码在本机生成。",
+        "网络请求" to "音乐平台接口和同步服务直接请求对应平台；更新清单与 APK 通过随应用配置的 CDN 镜像获取，没有本项目自建中转服务器。汽水播放签名器默认使用 SodaM 的公共签名服务（可在设置里关闭或换成自建实例），会员整曲的取流请求会带着 Cookie 和完整请求头发给该服务。YouTube Music 直连 YouTube 取流；使用 music.op.wiki 音源时，搜索和音频由这个第三方服务提供，取流只发送歌曲 ID，不发送 Cookie。用 music.op.wiki 账号登录时，用户名和密码只发给它，本机只保存会话 Cookie。第三方仍会看到其服务所需的常规请求信息。扫码登录的二维码在本机生成。",
         "播放上报" to "开启“播放上报”（设置 › 播放上报，默认开）后，正在播放的曲目 ID、实际播放时长（暂停不计）、是否播完，以及切歌 / 暂停 / 换队列的原因会回传给该曲目所属的平台，用来让推荐流跟上你的口味；汽水还会把最近听过的曲目连时长一起带在推荐请求里。接入的平台有汽水音乐、网易云音乐、QQ音乐、酷我音乐和千千音乐；咪咕与 JOOX 公开面上没有可实现的上报接口。上报不带用户名、Cookie、播放地址或文件内容。关掉开关后一个请求都不发，已经发出去的服务端记录不会撤回。",
         "诊断信息" to "复制诊断只包含版本、设备型号、Android 版本、启用平台和最近错误；不包含 Cookie、令牌或完整播放 URL。",
     )

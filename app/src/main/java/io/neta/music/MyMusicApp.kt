@@ -13,6 +13,7 @@ import io.neta.music.data.AccountProfileStore
 import io.neta.music.data.ListenTaskStore
 import io.neta.music.data.MusicRepository
 import io.neta.music.data.SettingsStore
+import io.neta.music.data.lx.LxSources
 import io.neta.music.data.native.AppleTokenCache
 import io.neta.music.data.native.NativeProviders
 import io.neta.music.data.native.SodaPlayReporter
@@ -129,6 +130,7 @@ class MyMusicApp : Application(), ViewModelStoreOwner, Configuration.Provider {
 
     override fun onCreate() {
         super.onCreate()
+        LxSources.attach(this)
         systemTheme.start()
         AppleTokenCache.attach(this)
         val backgroundWork = BackgroundWork.available(this)

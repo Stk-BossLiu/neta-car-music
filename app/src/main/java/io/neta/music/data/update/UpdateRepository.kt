@@ -15,6 +15,8 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import io.neta.music.BuildConfig
+import io.neta.music.data.CdnMirror
+import io.neta.music.data.CdnMirrors
 import io.neta.music.data.SettingsStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -92,9 +94,6 @@ data class UpdateUiState(
 
 enum class InstallResult { Launched, NeedsPermission, Failed }
 
-@Serializable
-private data class UpdateCdnProvider(val name: String = "", val prefix: String)
-
 class UpdateRepository(
     private val context: Context,
     private val settings: SettingsStore,
@@ -104,16 +103,7 @@ class UpdateRepository(
         .build(),
 ) {
     private val json = Json { ignoreUnknownKeys = true }
-    private val mirrors by lazy {
-        context.assets.open("cdn-providers.json").bufferedReader().use { reader ->
-            json.decodeFromString<List<UpdateCdnProvider>>(reader.readText())
-                .map {
-                    val prefix = it.prefix.trim().trimEnd('/')
-                    it.copy(prefix = if (prefix.isEmpty()) "" else "$prefix/")
-                }
-                .distinctBy { it.prefix }
-        }
-    }
+    private val mirrors by lazy { CdnMirrors.load(context) }
     private val downloadHttp = http.newBuilder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
@@ -247,7 +237,7 @@ class UpdateRepository(
         try {
             var lastError: Exception? = null
             var downloaded = false
-            var successfulMirror: UpdateCdnProvider? = null
+            var successfulMirror: CdnMirror? = null
             val order = mirrorOrder()
             for ((index, mirror) in order.withIndex()) {
                 currentCoroutineContext().ensureActive()
@@ -260,7 +250,7 @@ class UpdateRepository(
                     )
                 }
                 try {
-                    downloadFrom(mirrorUrl(mirror, info.url), target, info)
+                    downloadFrom(CdnMirrors.url(mirror, info.url), target, info)
                     downloaded = true
                     successfulMirror = mirror
                     break
@@ -406,15 +396,15 @@ class UpdateRepository(
     }
 
     /** 上次完整下载成功的线路优先，其后按资源列表顺序；不再让全量 HEAD 测速阻塞实际请求。 */
-    private suspend fun mirrorOrder(): List<UpdateCdnProvider> {
+    private suspend fun mirrorOrder(): List<CdnMirror> {
         val previous = settings.state.first().lastSuccessfulUpdateCdn
         return mirrors.sortedBy { if (it.prefix == previous) 0 else 1 }
     }
 
     /** 依次尝试各线路，返回第一个能解析且 schema 正确的更新清单。 */
-    private fun fetchManifest(order: List<UpdateCdnProvider>): UpdateManifest? {
+    private fun fetchManifest(order: List<CdnMirror>): UpdateManifest? {
         for (mirror in order) {
-            val body = fetchText(mirrorUrl(mirror, MANIFEST_URL)) ?: continue
+            val body = fetchText(CdnMirrors.url(mirror, MANIFEST_URL)) ?: continue
             val manifest = runCatching { json.decodeFromString<UpdateManifest>(body) }.getOrNull() ?: continue
             if (manifest.schema == "neta.music.update") return manifest
         }
@@ -435,9 +425,6 @@ class UpdateRepository(
     } catch (_: Exception) {
         null
     }
-
-    private fun mirrorUrl(mirror: UpdateCdnProvider, target: String): String =
-        mirror.prefix + target
 
     private fun verifyApk(file: File, info: UpdateInfo) {
         val current = currentPackageInfo() ?: throw IOException("无法读取当前版本")

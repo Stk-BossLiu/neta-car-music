@@ -147,14 +147,24 @@ dependencies {
     implementation(libs.material.kolor)
     implementation(libs.material.kolor.palette)
     implementation(libs.androidx.media3.common)
+    // music.op.wiki 的音频要绕过证书校验，OkHttp 数据源是按域名接进播放器的那一层
+    implementation(libs.androidx.media3.datasource.okhttp)
     implementation(libs.androidx.media3.exoplayer)
     implementation(libs.androidx.media3.exoplayer.hls)
     implementation(libs.androidx.media3.exoplayer.dash)
     implementation(libs.androidx.media3.session)
+    // 内嵌 libFLAC：系统解码器吃不下 24 位无损（酷我），FLAC 统一走这个扩展
+    implementation(project(":lib-decoder-flac"))
     implementation(libs.coil.compose)
     implementation(libs.coil.network.okhttp)
     implementation(libs.okhttp)
     implementation(libs.nanohttpd)
+    // 落雪自定义音源：与官方移动版相同的 QuickJS 脚本环境 + 执行中断
+    implementation(libs.quickjs.android)
+    implementation(project(":lib-runtime-lx"))
+    // 词幕（Lyricon）歌词互通
+    implementation(libs.lyricon.provider)
+    implementation(libs.lyricon.subscriber)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.datastore.preferences)

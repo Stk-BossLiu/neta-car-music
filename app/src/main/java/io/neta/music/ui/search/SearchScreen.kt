@@ -100,6 +100,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.State
@@ -132,6 +133,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -142,6 +144,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import io.neta.music.widget.SearchRequest
 import io.neta.music.aggregate.AggregationSettings
 import io.neta.music.aggregate.Availability
@@ -457,6 +461,8 @@ fun SearchScreen(
                 actionTrack.value = null
                 actions.openMerge(track)
             },
+            onOpenArtist = { name -> actions.openArtistByName(name, song) },
+            onOpenAlbum = { actions.openAlbumOf(song) },
         )
     }
     if (ctx.pickerOpen) {
@@ -505,20 +511,38 @@ private fun TouchSearch(
     val window = LocalAppWindow.current
     val landing = ctx.submittedQuery.value.isBlank()
     val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    val view = LocalView.current
     val fieldFocus = remember { FocusRequester() }
+
+    // 车机输入法在导航转场和系统栏边距变化期间会丢掉最早的显示请求：等键盘真正弹出来
+    // 为止逐帧重试（上限约一秒），已弹出就不再打扰
+    suspend fun focusAndShowKeyboard() {
+        for (frame in 0 until 60) {
+            withFrameNanos { }
+            if (ViewCompat.getRootWindowInsets(view)?.isVisible(WindowInsetsCompat.Type.ime()) == true) return
+            runCatching { fieldFocus.requestFocus() }
+            keyboard?.show()
+        }
+    }
+
     LaunchedEffect(focusSignal) {
         if (focusSignal == 0) return@LaunchedEffect
-        withFrameNanos { }
-        runCatching { fieldFocus.requestFocus() }
+        focusAndShowKeyboard()
     }
     // 平板有结果时，输入中改成搜索框下方的 Docked search view，叠在结果上
     val docked = window.isTablet && editing && !landing
     val narrow = if (window.isPhone) Modifier.fillMaxWidth() else Modifier.widthIn(max = 640.dp).fillMaxWidth()
 
     LaunchedEffect(Unit) {
-        if (landing) {
-            withFrameNanos { }
-            runCatching { fieldFocus.requestFocus() }
+        if (landing) focusAndShowKeyboard()
+    }
+    // 切走时输入框随页面退出组合，但车机输入法还记得这个编辑框，会趁别的页面系统栏、
+    // 边距变化时重新弹出软键盘：退出前清焦点、收键盘
+    DisposableEffect(Unit) {
+        onDispose {
+            focusManager.clearFocus()
+            keyboard?.hide()
         }
     }
 

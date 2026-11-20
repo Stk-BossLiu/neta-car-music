@@ -54,11 +54,15 @@ data class TrackSource(
     val isPreview: Boolean = false,
     val originalRank: Int = 0,
     val checkedAt: Long = 0L,
+    /** 组合源的解析缓存键；原生源留空，继续按歌曲 key 缓存。 */
+    val resolutionKey: String = "",
 ) {
     val qualityLabel: String get() = listOfNotNull(
         song.bitrate.takeIf { it > 0 }?.let { "$it kbps" },
         song.ext.takeIf { it.isNotBlank() }?.uppercase(Locale.ROOT),
     ).joinToString(" · ").ifBlank { "音质未知" }
+    val actualProviderName: String get() = song.extra["lx_source"]?.takeIf { it.isNotBlank() }
+        ?.let { "$providerName · $it" } ?: providerName
 }
 
 data class SourcePolicy(
@@ -132,9 +136,9 @@ data class SongMatchResult(
 
 @Serializable
 data class AggregationSettings(
-    val enabledProviders: List<String> = listOf("netease", "qq", "kugou", "kuwo", "migu"),
+    val enabledProviders: List<String> = listOf("netease", "qq", "kugou", "kuwo", "migu", "lx"),
     val playbackMode: PlaybackMode = PlaybackMode.Auto,
-    val providerPriority: List<String> = listOf("netease", "qq", "kugou", "kuwo", "migu", "apple"),
+    val providerPriority: List<String> = listOf("netease", "qq", "kugou", "kuwo", "migu", "lx", "apple"),
     val pinnedProvider: String? = null,
     val allowPreview: Boolean = false,
     val matchStrictness: MatchStrictness = MatchStrictness.Strict,

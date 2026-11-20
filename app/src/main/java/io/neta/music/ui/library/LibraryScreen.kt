@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -122,6 +123,7 @@ import io.neta.music.ui.EmptyState
 import io.neta.music.ui.InputDialog
 import io.neta.music.ui.LocalPlaylistSummary
 import io.neta.music.ui.MusicActions
+import io.neta.music.ui.MusicChip
 import io.neta.music.ui.MusicUiState
 import io.neta.music.ui.providerName
 import io.neta.music.ui.adaptive.DialogAvoidsFold
@@ -169,7 +171,7 @@ class LibraryNav(
     val openLocalMusic: () -> Unit = {},
 )
 
-/** 新建菜单的三项：新建歌单、导入歌单链接、从文件导入。三端只是外形不同。 */
+/** 新建菜单的三项：新建歌单、导入歌单（链接或 ID）、从文件导入。三端只是外形不同。 */
 private class NewMenu(val onCreate: () -> Unit, val onLink: () -> Unit, val onFile: () -> Unit)
 
 @Composable
@@ -216,7 +218,9 @@ fun LibraryScreen(
     if (linkOpen) {
         LinkImportDialog(
             isLink = actions::isLink,
-            onImport = actions::importLink,
+            providers = state.providers,
+            defaultProviderId = "",
+            onImport = actions::importPlaylist,
             onDismiss = { linkOpen = false },
         )
     }
@@ -617,7 +621,7 @@ private fun TvLibrary(
             Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(SegmentGap)) {
                 val rows = listOf(
                     Triple(Icons.AutoMirrored.Filled.PlaylistAdd, "新建歌单", menu.onCreate),
-                    Triple(Icons.Filled.Link, "导入歌单链接", menu.onLink),
+                    Triple(Icons.Filled.Link, "导入歌单", menu.onLink),
                     Triple(Icons.Filled.FileOpen, "从文件导入", menu.onFile),
                 )
                 rows.forEachIndexed { index, (icon, label, action) ->
@@ -1164,7 +1168,7 @@ private fun BoxScope.LibraryFabMenu(expanded: Boolean, onExpandedChange: (Boolea
     ) {
         FloatingActionButtonMenuItem(
             onClick = { onExpandedChange(false); menu.onLink() },
-            text = { Text("导入歌单链接") },
+            text = { Text("导入歌单") },
             icon = { Icon(Icons.Filled.Link, null) },
         )
         FloatingActionButtonMenuItem(
@@ -1207,7 +1211,7 @@ private fun NewPlaylistSplitButton(menu: NewMenu, modifier: Modifier = Modifier)
                 }
                 DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }, shape = RoundedCornerShape(20.dp)) {
                     DropdownMenuItem(
-                        text = { Text("导入歌单链接") },
+                        text = { Text("导入歌单") },
                         leadingIcon = { Icon(Icons.Filled.Link, null) },
                         onClick = { expanded = false; menu.onLink() },
                     )
@@ -1222,14 +1226,27 @@ private fun NewPlaylistSplitButton(menu: NewMenu, modifier: Modifier = Modifier)
     )
 }
 
-/** 导入歌单链接：识别后打开歌单详情，在那里可以“存到本地歌单”。 */
+/** 导入歌单：粘贴分享链接，或输入歌单 ID 并选择平台；识别后打开详情并自动绑定为本地歌单。 */
 @Composable
-private fun LinkImportDialog(isLink: (String) -> Boolean, onImport: (String) -> Unit, onDismiss: () -> Unit) {
+internal fun LinkImportDialog(
+    isLink: (String) -> Boolean,
+    providers: List<ProviderInfo>,
+    defaultProviderId: String,
+    onImport: (text: String, providerId: String?) -> Unit,
+    onDismiss: () -> Unit,
+) {
     var value by remember { mutableStateOf("") }
-    val valid = value.isNotBlank() && isLink(value)
+    val importable = remember(providers) { providers.filter { it.parsePlaylist } }
+    val link = value.isNotBlank() && isLink(value)
+    // 裸歌单 ID：不是链接也没有空白（歌单 ID 是一串字符，带空格的输入按无效处理）
+    val bareId = value.isNotBlank() && !link && !value.any { it.isWhitespace() }
+    var providerId by remember(importable) {
+        mutableStateOf(importable.firstOrNull { it.id == defaultProviderId }?.id ?: importable.firstOrNull()?.id.orEmpty())
+    }
+    val valid = link || (bareId && providerId.isNotBlank())
     val submit = {
         if (valid) {
-            onImport(value.trim())
+            onImport(value.trim(), if (link) null else providerId)
             onDismiss()
         }
     }
@@ -1237,30 +1254,47 @@ private fun LinkImportDialog(isLink: (String) -> Boolean, onImport: (String) -> 
         onDismissRequest = onDismiss,
         title = {
             DialogAvoidsFold()
-            Text("导入歌单链接")
+            Text("导入歌单")
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "粘贴平台歌单或专辑的分享链接。识别后打开详情，点“存到本地歌单”保存。",
+                    "粘贴平台歌单的分享链接，或输入歌单 ID 并选择平台。导入后自动绑定为本地歌单，平台更新自动同步。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 OutlinedTextField(
                     value = value,
                     onValueChange = { value = it },
-                    label = { Text("链接") },
+                    label = { Text("链接或歌单 ID") },
                     singleLine = true,
                     isError = value.isNotBlank() && !valid,
-                    supportingText = if (value.isNotBlank() && !valid) ({ Text("没有识别到平台链接") }) else null,
+                    supportingText = if (value.isNotBlank() && !valid) ({ Text("没有识别到平台链接或歌单 ID") }) else null,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
                     keyboardActions = KeyboardActions(onGo = { submit() }),
-                    trailingIcon = { ScanInputIcons("歌单链接", onValueChange = { value = it }) },
+                    trailingIcon = { ScanInputIcons("歌单链接或 ID", onValueChange = { value = it }) },
                     modifier = Modifier.fillMaxWidth(),
                 )
+                if (bareId && importable.isNotEmpty()) {
+                    // 裸 ID 不带域名，不同平台的 ID 又都是一串数字，必须选好平台才能对上
+                    Text(
+                        "选择歌单所属平台",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        importable.forEach { provider ->
+                            MusicChip(
+                                text = provider.name,
+                                selected = provider.id == providerId,
+                                onClick = { providerId = provider.id },
+                            )
+                        }
+                    }
+                }
             }
         },
-        confirmButton = { TextButton(onClick = submit, enabled = valid) { Text("识别") } },
+        confirmButton = { TextButton(onClick = submit, enabled = valid) { Text("导入") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 }
