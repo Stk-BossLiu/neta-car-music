@@ -95,7 +95,7 @@ internal class MusicMcpServer(private val app: MyMusicApp) : NanoHTTPD("127.0.0.
                 source = string(args, "source"),
                 queueKind = string(args, "kind"),
                 limit = integer(args, "limit", 30),
-                shuffle = boolean(args, "shuffle", false),
+                shuffle = boolean(args, "shuffle"),
             )
             "get_playback_state" -> PlaybackControlRequest(command = "query_mode")
             else -> throw IllegalArgumentException("未知工具：${params.optString("name")}")
@@ -129,8 +129,8 @@ internal class MusicMcpServer(private val app: MyMusicApp) : NanoHTTPD("127.0.0.
         return (args.get(key) as? Number)?.toInt() ?: throw IllegalArgumentException("$key 应为整数")
     }
 
-    private fun boolean(args: JSONObject, key: String, default: Boolean): Boolean {
-        if (!args.has(key)) return default
+    private fun boolean(args: JSONObject, key: String): Boolean? {
+        if (!args.has(key)) return null
         return args.get(key) as? Boolean ?: throw IllegalArgumentException("$key 应为布尔值")
     }
 
@@ -165,8 +165,7 @@ internal class MusicMcpServer(private val app: MyMusicApp) : NanoHTTPD("127.0.0.
                 .put("description", "队列最多保留的歌曲数。"))
             .put("shuffle", JSONObject()
                 .put("type", "boolean")
-                .put("default", false)
-                .put("description", "用户明确要求随机播放时设为 true。"))
+                .put("description", "省略时保留当前随机播放设置；用户明确要求随机播放时设为 true，要求顺序播放时设为 false。循环模式始终保留当前设置。"))
         return JSONArray()
             .put(JSONObject()
                 .put("name", "play_song")

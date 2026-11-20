@@ -17,7 +17,7 @@ internal data class PlaybackControlRequest(
     val artist: String = "",
     val queueKind: String = "",
     val limit: Int = 30,
-    val shuffle: Boolean = false,
+    val shuffle: Boolean? = null,
     val mode: String = "",
     val requestId: String = "",
 )
